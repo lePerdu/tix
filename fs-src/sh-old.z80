@@ -1,0 +1,402 @@
+;
+; sh.z80
+;
+
+.nolist
+#include "tix.inc"
+#include "stat.inc"
+#include "unistd.inc"
+#include "utils.inc"
+.list
+
+.org $0000
+.db "TIXE"
+.dw $100
+.dw $40
+.dw text
+.dw text_end - text
+.dw data
+.dw data_end - data
+
+text:
+tixe_sec_start("text")
+
+    ; This is a primative shell that executes programs.
+
+    lld de, bin_str
+    syscall chdir_
+    ljp c, error
+
+read_cmd:
+    lld iy, prompt_str
+    ld bc, prompt_str_len
+    ld a, STDOUT_FILENO
+    syscall write_
+    ljp c, error
+
+    lld iy, cmd_buf
+    ld bc, CMD_BUF_SIZE-1
+    ld a, STDIN_FILENO
+    syscall read_
+    ljp c, error
+
+    ; Append null byte
+    add iy, bc
+    ld (iy), 0
+
+    xor a
+    lld (parse_state), a
+    lld ix, args
+    lld iy, arg_buf
+    lld de, cmd_buf
+    ld h, d \ ld l, e
+
+parse_loop:
+    ld a, (hl)
+    or a
+    jr z, parse_finish_arg
+    cp ' '
+    jr z, parse_finish_arg
+    cp '\t'
+    jr z, parse_finish_arg
+    cp '\n'
+    jr z, parse_finish_arg
+    cp '>'
+    jr z, parse_redir_out
+    cp '<'
+    jr z, parse_redir_in
+
+    ld (iy), a
+    inc iy
+    ld a, arg_buf_end & $FF
+    cp iyl
+    jr nz, _
+    ld a, arg_buf_end >> 8
+    cp iyh
+    ljp z, error
+_:
+
+    inc hl
+    jr parse_loop
+
+parse_redir_out:
+    inc hl
+    ld a, (hl)
+    cp '>'
+    lld a, (parse_state)
+    jr z, _ ; Append redirection
+    or PS_REDIR_OUT
+    dec hl ; Go back to the '>'
+    jr ++_
+_:
+    or PS_REDIR_OUT | PS_APPEND
+_:
+    lld (parse_state), a
+
+    jr parse_finish_arg_no_flag
+
+parse_redir_in:
+    lld a, (parse_state)
+    or PS_REDIR_IN
+    lld (parse_state), a
+    jr parse_finish_arg_no_flag
+
+parse_finish_arg:
+    lld a, (parse_state)
+    bit BIT_PS_REDIR_OUT, a
+    jr nz, parse_open_redir_out
+    bit BIT_PS_REDIR_IN
+    jr nz, parse_open_redir_in
+
+parse_finish_arg_no_flag:
+    lcall parse_dup_arg
+
+    inc hl
+    lld de, whitespace_str
+    push hl
+        lcall strspn
+    pop hl
+    add hl, bc
+    ld d, h \ ld e, l
+    ld a, (hl)
+    or a
+    jr z, parse_end
+
+    ljp parse_loop
+
+parse_open_redir_out:
+    push hl ; Input pointer
+    push ix
+        ; Save the old stdout if not already saved
+        lld a, (stdout_save)
+        cp $FF
+        jr z, _
+        ld a, STDOUT_FILENO
+        ld de, F_DUPFD_CLOEXEC ; Don't persist in the child process
+        syscall fcntl_
+        ljp c, error
+        ld (stdout_save), a
+_:
+
+        ; Close the original one
+        ld a, STDOUT_FILENO
+        syscall close_
+
+        ; Redirection file name is in arg_buf.
+        ; Make the filename null-terminated
+        ld (iy), 0
+
+        lld a, (parse_state)
+        and PS_APPEND
+        jr nz, _
+        ld hl, O_WRONLY | O_TRUNC | O_CREAT
+        jr ++_
+_:
+        ld hl, O_WRONLY | O_APPEND | O_CREAT
+_:
+        lld de, arg_buf
+        ; Creation mode in case the file does not exist
+        ld bc, S_IFREG | S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH
+        syscall open_
+        ljp c, error
+    pop ix
+    pop hl
+    ld d, h \ ld e, l
+
+    lld a, (parse_state)
+    and ~(PS_REDIR_OUT | PS_APPEND) & $FF
+    lld (parse_state), a
+
+    lld iy, arg_buf
+    ljp parse_loop
+
+parse_open_redir_in:
+    push hl ; Input pointer
+    push ix
+        ; Save the old stdin if not already saved
+        lld a, (stdin_save)
+        cp $FF
+        jr z, _
+        ld a, STDIN_FILENO
+        ld de, F_DUPFD_CLOEXEC ; Don't persist in the child process
+        syscall fcntl_
+        ljp c, error
+        ld (stdin_save), a
+_:
+
+        ; Close the original one
+        ld a, STDIN_FILENO
+        syscall close_
+
+        ; Redirection file name is in arg_buf.
+        ; Make the filename null-terminated
+        ld (iy), 0
+
+        lld de, arg_buf
+        ld hl, O_RDONLY
+        syscall open_
+        ljp c, error
+    pop ix
+    pop hl
+    ld d, h \ ld e, l
+
+    lld a, (parse_state)
+    and ~PS_REDIR_IN & $FF
+    lld (parse_state), a
+
+    lld iy, arg_buf
+    ljp parse_loop
+
+parse_end:
+
+    ld (ix), 0
+    ld (ix+1), 0
+
+    syscall vfork_
+    jr c, error
+    or a
+    jr z, child_fork
+parent_fork:
+
+    ; Free all of the arguments
+    lld ix, arg_buf
+_:
+    ld l, (ix)
+    inc ix
+    ld h, (ix)
+    inc ix
+    ld a, h
+    or l
+    jr z, _
+    syscall free_
+    jr -_
+_:
+
+    ; Restore file descriptors
+    ; TODO Save/restore all file descriptors, not just these
+    lld a, (stdout_save)
+    cp $FF
+    jr z, _
+    ld c, STDOUT_FILENO
+    syscall dup2_
+    lld a, (stdout_save)
+    syscall close_
+    ld a, $FF
+    lld (stdout_save), a
+_:
+    ld a, (stdin_save)
+    cp $FF
+    jr z, _
+    ld c, STDIN_FILENO
+    syscall dup2_
+    lld a, (stdin_save)
+    syscall close_
+    ld a, $FF
+    lld (stdin_save), a
+_:
+    ld a, (stderr_save)
+    cp $FF
+    jr z, _
+    ld c, STDERR_FILENO
+    syscall dup2_
+    lld a, (stderr_save)
+    syscall close_
+    ld a, $FF
+    lld (stderr_save), a
+_:
+
+    syscall wait_
+    jr c, error
+
+    ljp read_cmd
+
+child_fork:
+    ; Command is the first argument
+    lld hl, args
+    ld a, (hl)
+    ld ixl, a
+    inc hl
+    ld a, (hl)
+    ld ixh, a
+    inc hl
+    syscall execv_
+
+    ; This is technically undefined behavior, but calling functions is
+    ; allowed in TIX
+    lld iy, not_found_str
+    ld bc, not_found_str_len
+    ld a, STDERR_FILENO
+    syscall write_
+
+    ld hl, -1
+    syscall _exit_
+
+error:
+    lld iy, error_str
+    ld bc, error_str_len
+    ld a, STDERR_FILENO
+    syscall write_
+
+    jr $
+
+
+;; Duplicates an argument to the heap
+; Parameters:
+;   (ix) - Place to store argument pointer.
+;   (iy) - End of argument string. (start is arg_buf)
+; Return:
+;   iy - arg_buf.
+;   (ix) - Next argument element.
+; Preserves:
+;   hl
+;
+parse_dup_arg:
+    ; hl = end of argument buffer
+    ; bc = end of (read) input buffer
+    push iy
+        ex (sp), hl
+    pop bc
+
+    lld de, arg_buf
+    sbc hl, de
+    jr nz, _
+    ; Do nothing with empty arguments
+    ld h, b \ ld l, c
+    ret
+_:
+    ; hl = arg_buf = arugment string
+    ; de = string length
+    ex de, hl
+    push bc ; Input buffer pointer
+        ld b, d \ ld c, e
+        lcall strndup
+    pop de 
+
+    ljp c, error
+    ld (ix), l
+    inc ix
+    ld (ix), h
+    inc ix
+
+    lld iy, arg_buf
+
+    ex de, hl ; Restore hl
+    ret
+
+#include "test/string.z80"
+
+tixe_sec_end()
+text_end:
+
+data:
+tixe_sec_start("data")
+
+parse_state:
+    .db 0
+DEFINE_OR_MASK(PS_DQUOT, 0)
+DEFINE_OR_MASK(PS_SQUOT, 1)
+DEFINE_OR_MASK(PS_REDIR_OUT, 2)
+DEFINE_OR_MASK(PS_APPEND, 3)
+DEFINE_OR_MASK(PS_REDIR_IN, 4)
+
+stdin_save:
+    .db $FF
+stdout_save:
+    .db $FF
+stderr_save:
+    .db $FF
+
+whitespace_str:
+    .db " \t\n",0
+
+bin_str:
+    .db "/bin",0
+
+prompt_str:
+    .db "$ ",0
+prompt_str_len .equ $ - prompt_str
+
+not_found_str:
+    .db "Cmd not found.\n",0
+not_found_str_len .equ $ - not_found_str
+
+error_str:
+    .db "\nError\n",0
+error_str_len .equ $ - error_str
+
+args:
+    .fill 20
+
+CMD_BUF_SIZE .equ 255
+cmd_buf:
+    .fill CMD_BUF_SIZE
+
+; TODO Dynamically allocate/grow this
+ARG_BUF_SIZE .equ 64
+arg_buf:
+    .fill ARG_BUF_SIZE
+arg_buf_end:
+
+tixe_sec_end()
+data_end:
+
