@@ -1,0 +1,682 @@
+;
+; text.z80
+;
+; Functions for drawing text.
+;
+
+.nolist
+#include "display.inc"
+#include "memmap.inc"
+#include "ports.inc"
+#include "text.inc"
+.list
+
+;; Gets the row count based on the current font size.
+; Return:
+;   a - Current row count.
+; Preserves:
+;   bc, de, hl, ix, iy
+;
+text_row_count_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _
+    ld a, TEXT_ROW_COUNT_3X5
+    ret
+_:
+    ld a, TEXT_ROW_COUNT_5X7
+    ret
+; }}}
+
+
+;; Gets the column count based on the current font size.
+; Return:
+;   a - Current column count.
+; Preserves:
+;   bc, de, hl, ix, iy
+;
+text_col_count_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _
+    ld a, TEXT_COL_COUNT_3X5
+    ret
+_:
+    ld a, TEXT_COL_COUNT_5X7
+    ret
+; }}}
+
+
+;; Gets the current font height.
+; Return:
+;   a - Font height
+; Preserves:
+;   bc, de, hl, ix, iy
+;
+text_get_height_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _
+    ld a, 5
+    ret
+_:
+    ld a, 7
+    ret
+; }}}
+
+
+;; Gets the current font bitmap location.
+; Return:
+;   (hl) - Font bitmap start.
+; Preserves:
+;   bc, de, ix, iy
+;
+text_get_font_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _
+    ld hl, font3x5
+    ret
+_:
+    ld hl, font5x7
+    ret
+; }}}
+
+
+;; Gets the cursor sprite based on the current font size.
+; Return:
+;   (iy) - Cursor sprite.
+; Preserves:
+;   bc, de, hl, ix
+;
+text_get_cursor_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _
+    ld iy, font3x5_cursor
+    ret
+_:
+    ld iy, font5x7_cursor
+    ret
+; }}}
+
+
+;; Gets the offset to the alpha cursor based on the current font.
+; Alpha cursor comes before 2nd cursor.
+; Return:
+;   hl - Offset to the alpha cursor from the normal one.
+; Preserves:
+;   bc, de, ix, iy
+;
+text_get_alpha_cur_off_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _
+    ld a, 5
+    ret
+_:
+    ld a, 7
+    ret
+; }}}
+
+
+;; Gets the offset to the 2nd cursor based on the current font.
+; 2nd cursor comes after alpha cursor.
+; Return:
+;   hl - Offset to the 2nd cursor from the normal one.
+; Preserves:
+;   bc, de, ix, iy
+;
+text_get_2nd_cur_off_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _
+    ld a, 10
+    ret
+_:
+    ld a, 14
+    ret
+; }}}
+
+
+;; Gets the sprite for erasing a character.
+; This should be drawn with gr_put_sprite_and().
+; Return:
+;   (iy) - Erase sprite.
+;
+text_get_blank_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _
+    ld iy, font3x5_blank
+    ret
+_:
+    ld iy, font5x7_blank
+    ret
+; }}}
+
+
+;; Gets the screen coordinates of the current text cursor.
+; Return:
+;   (hl) - Screen buffer.
+;   d - Column.
+;   e - Row.
+;   b - Height of the font. (Because this function is called to prepare for a
+;       gr_put_sprite routine).
+;
+text_get_screen_coord: ; {{{
+    ld hl, text_screen_buf
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _textgsc_5x7
+_textgsc_3x5:
+    ld a, (text_row)
+    ; 6 rows per character
+    add a, a
+    ld b, a
+    add a, a
+    add a, b
+    ld e, a
+
+    ld a, (text_col)
+    ; 4 pixels per character
+    add a, a
+    add a, a
+    ld d, a
+
+    ld b, 5
+
+    ret
+
+_textgsc_5x7:
+    ld a, (text_row)
+    ; 8 rows per character
+    add a, a
+    add a, a
+    add a, a
+    ld e, a
+
+    ld a, (text_col)
+    ; 6 pixels per character
+    ld d, a
+    add a, a
+    add a, d
+    add a, a
+    ld d, a
+
+    ld b, 7
+
+    ret
+; }}}
+
+
+;; Copies the text buffer to the screen.
+;
+text_copy_buf: ; {{{
+    ld hl, text_screen_buf
+    jp lcd_copy
+; }}}
+
+
+;; Draws a character sprite at the current text position in a font-dependent
+;; manner.
+; Parameters:
+;   (iy) - Sprite to draw.
+;
+text_put_sprite_: ; {{{
+    call text_get_screen_coord
+    ; Push de so we don't have to calculate them again
+    push bc
+    push de
+    push iy
+        ; Clear out the space
+        call text_get_blank_
+        call gr_put_sprite_and
+    pop iy
+    pop de
+    pop bc
+
+    ld hl, text_screen_buf
+    call gr_put_sprite_or
+    call text_copy_buf
+    ret
+; }}}
+
+
+;; Reads a character sprite at the current text position in a font-dependent
+;; manner.
+; Parameters:
+;   (hl) - Buffer to read into.
+;
+text_read_sprite_: ; {{{
+    ; TODO Implement or remove
+    ret
+; }}}
+
+
+;; Draws a character to the screen at the current position (text_col and
+;; text_row), advancing the position.
+; Parameters:
+;   a - The character to print, in ASCII.
+; Preserves:
+;   ix
+;
+text_putc: ; {{{
+    ld b, a
+    ld a, i
+    push af
+        di
+
+        push bc
+            call text_cursor_off
+        pop bc
+        ld a, b
+
+        ; Make sure a is a printable character. If not, then set it to the box
+        ; character.
+        ; Check for LF
+        cp CHAR_LF
+        jr nz, _
+        call _textpc_lf
+        jr _textpc_end
+_:
+        cp CHAR_CR
+        jr nz, _
+        call _textpc_cr
+        jr _textpc_end
+_:
+
+        call text_putc_inplace
+
+        ; Increment column
+        call text_col_count_
+        ld c, a
+        ld a, (text_col)
+        inc a
+        cp c
+        jr nz, _
+        call _textpc_lf
+        xor a ; Column 0 (TODO This LF does this right now but may not later)
+_:
+        ld (text_col), a
+
+_textpc_end:
+        call text_cursor_on
+    pop af
+    ret po
+    ei
+    ret
+
+_textpc_lf:
+        call text_row_count_
+        ld c, a
+        ld a, (text_row)
+        inc a
+        cp c
+        jr nz, _
+        call text_scroll_down_base_
+        jr ++_ ; Don't change the row
+_:
+        ; The cursor is already disabled from above
+        ld (text_row), a
+_:
+        ; Also CR (go to start of line)
+        ; TODO Should these be combined here or in the terminal or neither?
+        ;jr _textpc_cr
+
+_textpc_cr:
+        xor a
+        ld (text_col), a
+
+        ret
+; }}}
+
+
+;; Same as text_putc, but do not move the cursor.
+; This also does not process NL and CR characters (since they move the cursor).
+;
+text_putc_inplace: ; {{{
+    sub ' '
+    ; Below space is non-printable
+    jr c, _
+    cp 128 - ' '
+    ; At or above 127 is non-printable
+    jr c, ++_
+_:
+    ld a, CHAR_NOPRINT - ' '
+_:
+    ld c, a ; The adjusted character
+
+    ; Write character to text shadow
+    ; The dimensions of the array are treated the same for all font sizes so
+    ; that the text shadow can remain the same if the font changes.
+    ld hl, text_shadow
+    ; TEXT_COL_COUNT_3X5 = 24 and TEXT_ROW_COUNT_3X5 = 10
+    ; a can be used because 24*10 = 240 will not overflow
+    ld a, (text_col) ; Add this in later since it does not have to be multiplied
+    ld e, a
+    ld a, (text_row)
+    add a, a
+    add a, a
+    add a, a
+    ld b, a
+    add a, a
+    add a, b
+    add a, e ; Column
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+
+    ld (hl), c ; character
+
+    ; Get character address
+    ; Offset = height*(character - ' ')
+    ; This could overflow a, so hl is used
+    ld h, 0
+    ld l, c
+    ld d, h \ ld e, l
+    call text_get_height_
+    ld b, a
+    dec b ; hl = c*1 already
+_:
+    add hl, de
+    djnz -_
+    ex de, hl
+    call text_get_font_
+    add hl, de
+
+    push hl \ pop iy
+    jp text_put_sprite_
+; }}}
+
+
+;; Draws a null-terminated string to the screen.
+; Parameters:
+;   (hl) - The string to display.
+; Preserves:
+;   ix, iy
+;
+text_puts: ; {{{
+_:
+    ld a, (hl)
+    or a
+    ret z
+    push hl
+        call text_putc
+    pop hl
+
+    inc hl
+    jr -_
+; }}}
+
+
+;; Scrolls down a single line (of text).
+;
+text_scroll_down_base_: ; {{{
+    ld a, (text_flags)
+    bit BIT_TEXT_FONT, a
+    ; 0 - 5x7, 1 - 3x5
+    jr z, _textsd_5x7
+
+_textsd_3x5:
+    ld hl, text_screen_buf + (LCD_WIDTH / 8 * 6)
+    ld de, text_screen_buf
+    ld bc, LCD_WIDTH / 8 * 6 * (TEXT_ROW_COUNT_3X5 - 1)
+    ldir
+
+    ; Clear out the bottom row
+    ld b, LCD_WIDTH / 8 * 6
+    xor a
+_:
+    dec hl
+    ld (hl), a
+    djnz -_
+    ret
+
+_textsd_5x7:
+    ld hl, text_screen_buf + (LCD_WIDTH / 8 * 8)
+    ld de, text_screen_buf
+    ld bc, LCD_WIDTH / 8 * 8 * (TEXT_ROW_COUNT_5X7 - 1)
+    ldir
+
+    ; Clear out the bottom row
+    ld b, LCD_WIDTH / 8 * 8
+    xor a
+_:
+    dec hl
+    ld (hl), a
+    djnz -_
+    ret
+
+; }}}
+
+
+;; Scrolls the screen down a line of text.
+; Preserves:
+;   ix, iy
+;
+text_scroll_down: ; {{{
+    ld b, a
+    ld a, i
+    push af
+        di
+
+        ; Have to do this because the z offset has to be recomputed
+        push bc
+            call text_cursor_off
+        pop af
+        call text_scroll_down_base_
+        call text_cursor_on
+
+    pop af
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Draws the cursor at the current text position.
+; If the cursor is already shown, this has no effect.
+; The shadow of the text behind the cursor is saved so that it can be restored
+; upon the next call to text_cursor_off.
+; TODO When/if all text is written to a screen buffer, this can simply draw to
+; the screen and not the buffer, and text_cursor_off can just restore the screen
+; buffer.
+;
+text_cursor_on: ; {{{
+    ld a, (term_state)
+    ; If disabled or already on, do nothing
+    bit BIT_TERM_STATE_CURSOR_ENABLED, a
+    ret z
+    bit BIT_TERM_STATE_CURSOR_ON, a
+    ret nz
+
+    ld b, a
+    ld a, i
+    push af
+        di
+
+        ld a, b
+        or TERM_STATE_CURSOR_ON
+        ld (term_state), a
+
+        call text_get_cursor_
+        call text_get_screen_coord
+        ; Use XOR so that the cursor can be toggled simply by drawing it again.
+        call gr_put_sprite_xor
+
+        ; TODO Read the sprite into a buffer so that different cursor sprites
+        ; can be used to indicate the ALPHA and 2ND states.
+
+;         ld hl, text_cursor_shadow
+;         call text_read_sprite_
+
+;         call text_get_cursor_
+;         ld a, (key_states_special)
+;         bit BIT_KEY_STATE_SPECIAL_2ND, a
+;         jr z, _
+;         ex de, hl
+;         call text_get_2nd_cur_off_
+;         add hl, de
+; _:
+;         bit BIT_KEY_STATE_SPECIAL_ALPHA, a
+;         jr z, _
+;         ex de, hl
+;         call text_get_alpha_cur_off_
+;         add hl, de
+; _:
+
+;         call text_put_sprite_
+_textcon_end:
+    pop af
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Hides the cursor, restoring the shadow saved from text_cursor_on.
+; If the cursor is not currently shown, this has no effect.
+;
+; This should be called before the cursor position or the screen z offset is
+; changed (and text_cursor_on should be called after the change is made if the
+; cursor is enabled) since this uses text_row and text_col to determine where to
+; replace the saved cursor shadow.
+;
+text_cursor_off: ; {{{
+    ld a, (term_state)
+    bit BIT_TERM_STATE_CURSOR_ON, a
+    ret z
+
+    ld b, a
+    ; TODO Do interrupts need to be disabled?
+    ld a, i
+    push af
+        di
+
+        ld a, b
+        and ~TERM_STATE_CURSOR_ON & $FF
+        ld (term_state), a
+
+        call text_get_cursor_
+        call text_get_screen_coord
+        call gr_put_sprite_xor
+_textcoff_end:
+    pop af
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Sets the row of the cursor, turning it off before the move and back on after.
+; Parameters:
+;   a - New row to set.
+; Preserves:
+;   All
+;
+text_set_row:
+    push af
+    push bc
+    push de
+    push hl
+    ld b, a
+    ld a, i
+    push af
+        di
+
+        push bc
+            call text_cursor_off
+        pop af
+
+        ld (text_row), a
+
+        call text_cursor_on
+    pop af
+    jp po, _
+    ei
+_:
+    pop hl
+    pop de
+    pop bc
+    pop af
+    ret
+
+;; Sets the column of the cursor, turning it off before the move and back on
+;; after.
+; Parameters:
+;   a - New column to set.
+; Preserves:
+;   All
+;
+text_set_col:
+    push af
+    push bc
+    push de
+    push hl
+    ld b, a
+    ld a, i
+    push af
+        di
+
+        push bc
+            call text_cursor_off
+        pop af
+
+        ld (text_col), a
+
+        call text_cursor_on
+    pop af
+    jp po, _
+    ei
+_:
+    pop hl
+    pop de
+    pop bc
+    pop af
+    ret
+
+;; Sets the row and column of the cursor, turning it off before the move and
+;; back on after.
+; Parameters:
+;   d - New row to set.
+;   e - New column to set.
+;
+text_set_pos:
+    push af
+    push bc
+    push hl
+    ld a, i
+    push af
+        di
+
+        push de
+            call text_cursor_off
+        pop de
+
+        ld a, d
+        ld (text_row), a
+        ld a, e
+        ld (text_col), a
+
+        call text_cursor_on
+    pop af
+    jp po, _
+    ei
+_:
+    pop hl
+    pop bc
+    pop af
+    ret
+

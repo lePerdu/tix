@@ -1,0 +1,550 @@
+;
+; permissions.z80
+;
+; Permission checking/alterring functions.
+;
+
+
+;; Determines whether the current process has permissions to a file mode.
+; Parameters:
+;   a - Requested permission as a combination of O_EXEC, O_RDONLY, etc.
+;   hl - Inode of file to check.
+; Return:
+;   c flag - Set if the inode is invalid, reset if it is.
+;   z flag - Set if permission is granted, reset if not.
+; Preserves:
+;   ix, iy
+;
+perm_check_file: ; {{{
+    push af
+        call fs_get_uid_gid
+        jr c, _
+        push bc
+            call fs_get_mode
+        pop de ; UID, GID
+        jr c, _
+    pop af
+
+    jr perm_check_file_mode
+
+_:
+    pop af
+    xor a \ inc a ; Reset z
+    scf
+    ret
+; }}}
+
+
+;; Same as perm_check_file, except that the mode and UID/GID are passed as
+;; parameters, not retrieved from a file.
+; Parameters:
+;   a - Requested permission as a combination of O_EXEC, O_RDONLY, etc.
+;   bc - File mode.
+;   e - UID of the file.
+;   d - GID of the file.
+; Return:
+;   z flag - Set if permission is granted, reset if not.
+; Preserves:
+;   ix, iy
+;
+; TODO Check S_ISVTX for directories
+;
+perm_check_file_mode: ; {{{
+    and O_ACCMODE ; Dicard other bits
+    ret z ; Nothing requested, so everything is granted
+    push af
+        ; Check if the same (effective) UID
+        ld hl, (cur_process)
+        ld a, proc_ent_euid
+        add a, l
+        ld l, a
+        jr nc, _
+        inc h
+_:
+
+        ld a, (hl)
+        cp e
+        jr nz, _
+        ; Permission bits for the user are bits 6-8. There are shifted/rotated into
+        ; b to be checked in the O_ACCMODE range.
+        rlc c \ rl b
+        rlc c \ rl b
+        rrc c \ rrc c ; Restore c (no need to restore b)
+    pop af \ push af ; Retrieve the requested permissions
+        ld e, a ; e is free now that the UID has been checked
+        and b
+        ; Make sure no requested permissions were masked out by the file's
+        ; permissions
+        cp e
+        jr nz, _
+    pop bc ; Preserve f, so z is set from cp
+    ret
+_:
+    pop af
+    ld e, a ; e can be used now instead of the stack
+
+    ; Check if the same GID
+    ld a, proc_ent_egid - proc_ent_euid
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+
+    ld a, (hl)
+    cp d
+    jr nz, _
+    ; Permission bits for the group are bits 3-5. There are shifted/rotated into
+    ; b to be checked in the O_ACCMODE range.
+    ld a, c
+    srl a \ srl a \ srl a
+    ld b, a
+    ld a, e ; Retrieve the requested permissions
+    and b
+    cp e
+    ret z
+_:
+
+    ; Check 'other' bits
+    ; These are already in the right place (in c)
+    ld a, e ; Requested permissions
+    and c
+    cp e
+    ret ; With whatever z flag
+; }}}
+
+
+;; Helper function for get*id() functions.
+; Parameters:
+;   a - Offset in the process table entry of the byte to get.
+; Return:
+;   a - Requested value.
+; Preserves:
+;   bc, de, hl
+;
+perm_get_id_: ; {{{
+    ld hl, (cur_process)
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    ld a, (hl)
+    ret
+; }}}
+
+
+;; Gets the PID of the current process.
+; Return:
+;   a - Current PID.
+; Preserves:
+;   hl, bc, de, ix, iy
+;
+getpid: ; {{{
+    ld a, (cur_pid)
+    ret
+; }}}
+
+;; Gets the real UID of the current process.
+; Return:
+;   a - Real UID.
+; Preserves:
+;   bc, de, ix, iy
+;
+getuid: ; {{{
+    ld a, proc_ent_uid
+    jr perm_get_id_
+; }}}
+
+
+;; Gets the real GID of the current process.
+; Return:
+;   a - Real UID.
+; Preserves:
+;   bc, de, ix, iy
+;
+getgid: ; {{{
+    ld a, proc_ent_gid
+    jr perm_get_id_
+; }}}
+
+
+;; Gets the effective UID of the current process.
+; Return:
+;   a - Real UID.
+; Preserves:
+;   bc, de, ix, iy
+;
+geteuid: ; {{{
+    ld a, proc_ent_euid
+    jr perm_get_id_
+; }}}
+
+
+;; Gets the effective UID of the current process.
+; Return:
+;   a - Real UID.
+; Preserves:
+;   bc, de, ix, iy
+;
+getegid: ; {{{
+    ld a, proc_ent_egid
+    jr perm_get_id_
+; }}}
+
+
+;; Sets the UID of a process.
+; If the process is privileged, this sets the real, effective, and saved UIDs to
+; the new one. Otherwise, this sets the effective UID if the new one is equal to
+; the real or saved UID.
+;
+; Parameters:
+;   a - New UID to set.
+; Return:
+;   c flag - Reset if the UID could be set, set if not.
+; Preserves:
+;   de, ix, iy
+;
+; TODO Validate UID?
+;
+setuid: ; {{{
+    ld c, a ; Save
+    ld b, 0 ; Set to non-0 if unprivileged, but able to set effective UID
+    ld hl, (cur_process)
+
+    ; proc_ent_uid = 1
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setuid_priv
+    cp c
+    jr nz, _
+    inc b
+_:
+
+    ; proc_ent_euid = 2
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setuid_priv
+    cp c
+    jr nz, _
+    inc b
+_:
+
+    ; proc_ent_suid = 3
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setuid_priv
+    cp c
+    jr nz, _
+    inc b
+_:
+
+    ld a, b
+    or a
+    jr z, _
+    ld hl, EPERM
+    jp proc_set_errno ; Sets carry
+_:
+
+    ; Set just effective UID
+    ; hl is at the suid
+    ; proc_ent_euid = proc_ent_suid - 1
+    dec hl
+    ld (hl), c
+    or a
+    ret
+
+_setuid_priv:
+    ; We don't know where hl is, so we have to reset it
+    ld hl, (cur_process)
+    ; proc_ent_uid = 1
+    inc hl
+    ld (hl), c
+    ; proc_ent_euid = 2
+    inc hl
+    ld (hl), c
+    ; proc_ent_suid = 3
+    inc hl
+    ld (hl), c
+    or a
+    ret
+; }}}
+
+
+;; Sets the GID of a process.
+; If the process is privileged, this sets the real, effective, and saved GIDs to
+; the new one. Otherwise, this sets the effective GID if the new one is equal to
+; the real or saved GID.
+;
+; Parameters:
+;   a - New GID to set.
+; Return:
+;   c flag - Reset if the GID could be set, set if not.
+; Preserves:
+;   de, ix, iy
+;
+; TODO Validate GID?
+;
+setgid: ; {{{
+    ld c, a ; Save
+    ld b, 0 ; Set to non-0 if unprivileged, but able to set effective GID
+    ld hl, (cur_process)
+
+    ; proc_ent_gid = 4
+    inc hl \ inc hl \ inc hl \ inc hl
+    ld a, (hl)
+    or a
+    jr z, _setgid_priv
+    cp c
+    jr nz, _
+    inc b
+_:
+
+    ; proc_ent_egid = 5
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setgid_priv
+    cp c
+    jr nz, _
+    inc b
+_:
+
+    ; proc_ent_sgid = 6
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setgid_priv
+    cp c
+    jr nz, _
+    inc b
+_:
+
+    ld a, b
+    or a
+    jr z, _
+    ld hl, EPERM
+    jp proc_set_errno ; Sets carry
+_:
+
+    ; Set just effective GID
+    ; hl is currently at sgid
+    ; proc_ent_egid = proc_ent_sgid - 1
+    dec hl
+    ld (hl), c
+    or a
+    ret
+
+_setgid_priv:
+    ; We don't know where hl is, so we have to reset it
+    ld hl, (cur_process)
+    ; proc_ent_gid = 4
+    inc hl \ inc hl \ inc hl \ inc hl
+    ld (hl), c
+    ; proc_ent_egid = 5
+    inc hl
+    ld (hl), c
+    ; proc_ent_sgid = 6
+    inc hl
+    ld (hl), c
+    or a
+    ret
+; }}}
+
+
+;; Sets the real and effective UIDs of a process.
+; If a process is unprivileged, this can only set the real UID to the saved UID
+; and set the effective UID to the (original) real or saved UID.
+;
+; Parameters:
+;   e - New real UID to set. If -1, the real UID will not be changed.
+;   d - New effective UID to set. If -1, the effective UID will not be changed.
+; Return:
+;   c flag - Reset if either UID could be set, set if both could.
+; Preserves:
+;   b, de, ix, iy
+;
+; TODO Validate UID?
+;
+setreuid: ; {{{
+    ld c, 0 ; Bits 0/1 set if real/effective UIDs can be set
+    ld a, -1
+    cp d
+    jr nz, _
+    set 0, c
+_:
+    cp e
+    jr nz, _
+    set 1, c
+_:
+
+    ld a, 3
+    cp c
+    ret z ; Both are -1
+
+    ld hl, (cur_process)
+
+    ; proc_ent_uid = 1
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setreuid_priv
+    cp d
+    ; Effective UID can be set to real UID
+    jr nz, _
+    set 1, c
+_:
+    cp e
+    ; Real UID is unchanged
+    jr nz, _
+    set 0, c
+_:
+
+    ; proc_ent_euid = 2
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setreuid_priv
+    cp d
+    ; Effective UID not changed
+    jr nz, _
+    set 1, c
+_:
+
+    ; proc_ent_suid = 3
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setreuid_priv
+    cp d
+    ; Effective UID can be set to saved UID
+    jr nz, _
+    set 1, c
+_:
+    cp e
+    ; Real UID can be set to saved UID
+    jr nz, _
+    set 0, c
+_:
+
+    ld a, 3
+    cp c
+    jr z, _
+    ; One change cannot be made
+    ld hl, EPERM
+    jp proc_set_errno ; Sets carry
+_:
+
+_setreuid_priv:
+    ; We don't know where hl is, so we have to reset it
+    ld hl, (cur_process)
+    ; proc_ent_uid = 1
+    inc hl
+    ld (hl), d
+    ; proc_ent_euid = 2
+    inc hl
+    ld (hl), e
+    or a
+    ret
+; }}}
+
+
+;; Sets the real and effective GIDs of a process.
+; If a process is unprivileged, this can only set the real GID to the saved GID
+; and set the effective GID to the (original) real or saved GID.
+;
+; Parameters:
+;   e - New real GID to set. If -1, the real GID will not be changed.
+;   d - New effective GID to set. If -1, the effective GID will not be changed.
+; Return:
+;   c flag - Reset if either GID could be set, set if both could.
+; Preserves:
+;   b, de, ix, iy
+;
+; TODO Validate GID?
+;
+setregid: ; {{{
+    ld c, 0 ; Bits 0/1 set if real/effective GIDs can be set
+    ld a, -1
+    cp d
+    jr nz, _
+    set 0, c
+_:
+    cp e
+    jr nz, _
+    set 1, c
+_:
+
+    ld a, 3
+    cp c
+    ret z ; Both are -1
+
+    ld hl, (cur_process)
+
+    ; proc_ent_gid = 4
+    inc hl \ inc hl \ inc hl \ inc hl
+    ld a, (hl)
+    or a
+    jr z, _setregid_priv
+    cp d
+    ; Effective GID can be set to real GID
+    jr nz, _
+    set 1, c
+_:
+    cp e
+    ; Real GID is unchanged
+    jr nz, _
+    set 0, c
+_:
+
+    ; proc_ent_egid = 5
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setregid_priv
+    cp d
+    ; Effective GID not changed
+    jr nz, _
+    set 1, c
+_:
+
+    ; proc_ent_sgid = 6
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, _setregid_priv
+    cp d
+    ; Effective GID can be set to saved GID
+    jr nz, _
+    set 1, c
+_:
+    cp e
+    ; Real GID can be set to saved GID
+    jr nz, _
+    set 0, c
+_:
+
+    ld a, 3
+    cp c
+    jr z, _
+    ; One change cannot be made
+    ld hl, EPERM
+    jp proc_set_errno ; Sets carry
+_:
+
+_setregid_priv:
+    ; We don't know where hl is, so we have to reset it
+    ld hl, (cur_process)
+    ; proc_ent_gid = 4
+    inc hl \ inc hl \ inc hl \ inc hl
+    ld (hl), d
+    ; proc_ent_egid = 5
+    inc hl
+    ld (hl), e
+    or a
+    ret
+; }}}
+

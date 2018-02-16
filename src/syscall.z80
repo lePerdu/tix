@@ -1,0 +1,318 @@
+;
+; syscall.z80
+;
+; Code to handle system calls.
+;
+; System calls are identified by their offset in the syscall_table (an absolute
+; address TODO This may change if space is needed on ROM page $00 for system
+; calls). Each table entry contains the page and offset of the function. Restart
+; $10 takes looks up the entry in the table, maps pages other than $00 to memory
+; bank A ($00 is always mapped, so it does no mapping in this case), maps kernel
+; memory to bank C, and calls the function, then restores the page in banks A
+; and B.
+;
+
+.nolist
+#include "ports.inc"
+#include "priv.inc"
+.list
+
+;; The table storing the page and address of each system call.
+; Each entry is in the form:
+;   <page> <address>
+; For page 0, addresses are relative to that page ($0000).
+; For other pages, addresses are relative to memory bank A ($4000).
+; TODO As long as there are not a lot of paged system calls, just have wrapper
+; functions on page 0 to eliminate the return callback.
+syscall_table:
+    .db $00 \ .dw open
+    .db $00 \ .dw close
+    .db $00 \ .dw read
+    .db $00 \ .dw write
+    .db $00 \ .dw ftruncate
+    .db $00 \ .dw lseek
+
+    .db $00 \ .dw creat
+    .db $00 \ .dw mkdir
+    .db $00 \ .dw mknod
+    .db $00 \ .dw link
+    .db $00 \ .dw unlink
+    .db $00 \ .dw rmdir
+    .db $00 \ .dw remove
+    .db $00 \ .dw rename
+
+    .db $00 \ .dw dup
+    .db $00 \ .dw dup2
+    .db $00 \ .dw fcntl
+
+    .db $00 \ .dw opendir
+    .db $00 \ .dw closedir
+    .db $00 \ .dw readdir
+    .db $00 \ .dw rewinddir
+    .db $00 \ .dw telldir
+    .db $00 \ .dw seekdir
+
+    .db $00 \ .dw malloc
+    .db $00 \ .dw calloc
+    .db $00 \ .dw realloc
+    .db $00 \ .dw free
+
+    .db $00 \ .dw execve
+    .db $00 \ .dw execv
+    .db $00 \ .dw fork
+    .db $00 \ .dw vfork
+    .db $00 \ .dw wait
+    .db $00 \ .dw exit
+    .db $00 \ .dw _exit
+    .db $00 \ .dw _Exit
+
+    .db $00 \ .dw getpid
+    .db $00 \ .dw getuid
+    .db $00 \ .dw getgid
+    .db $00 \ .dw geteuid
+    .db $00 \ .dw getegid
+    .db $00 \ .dw setuid
+    .db $00 \ .dw setgid
+    .db $00 \ .dw setreuid
+    .db $00 \ .dw setregid
+    .db $00 \ .dw chdir
+    .db $00 \ .dw fchdir
+    .db $00 \ .dw getenv
+    .db $00 \ .dw putenv
+    .db $00 \ .dw getcwd
+    .db $00 \ .dw getwd
+
+    .db priv_page \ .dw priv_lock_flash
+    .db priv_page \ .dw priv_unlock_flash
+
+syscall_table_end:
+
+;; Calls a kernel function/system call.
+; This should be called via rst $10 directly before a system call number (like
+; TIOS's BCALL).
+; Parameters:
+;   ((sp)) - Index into the system call table.
+; Preserves:
+;   Whatever the system call preserves
+;
+; TODO Don't save/restore the page for system calls on page 0. Also have to make
+; sure all of these which modify mappings restore them when they are done.
+;
+syscall_handler: ; {{{
+    ; Reserve some space on the stack
+    dec sp ; Memory bank save
+    push hl ; Return callback address
+    push hl ; Syscall address
+
+    push af
+    push de
+    push hl
+        ld hl, 11
+        add hl, sp
+        ; If we move the stack pointer up to access the return addresses more
+        ; easily, an interrupt could fire and mess up the lower stack. (This
+        ; actually happened and was a pain to debug). Disabling interrupts and
+        ; moving sp was about the same size/speed as this, so I went with not
+        ; disabling interrupts and using less of the stack.
+
+        ; Return address
+        ld e, (hl)
+        inc hl
+        ld d, (hl)
+        ; a = syscall number
+        ld a, (de)
+        inc de
+        ; Put back addr+1
+        ld (hl), d
+        dec hl
+        ld (hl), e
+        dec hl
+
+        ; (de) = stack
+        ; (hl) = system call
+        ex de, hl
+        ; sizeof syscall = 3
+        ld h, 0
+        ld l, a
+        add hl, hl
+        add a, l
+        ld l, a
+        jr nc, _
+        inc h
+_:
+        ld a, syscall_table & $FF
+        add a, l
+        ld l, a
+        ld a, syscall_table >> 8
+        adc a, h
+        ld h, a
+
+        ld a, (hl)
+        or a
+        ; Only set the memory bank if the page is non-zero
+        jr z, _syscall_page_00
+
+_syscall_map_page:
+        ; TODO Only save the page when switching it. First have to make all
+        ; system calls preserve the page when they finish.
+        in a, (PORT_MEM_BANK_A)
+        ld (de), a
+        dec de
+
+        ld a, (hl)
+        out (PORT_MEM_BANK_A), a
+
+        ; de = syscall address
+        ; hl = stack position
+        inc hl
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        ex de, hl
+
+        ; Set return callback
+        ld (hl), _syscall_return >> 8
+        dec hl
+        ld (hl), _syscall_return & $FF
+        dec hl
+
+        ; Set syscall address
+        ld (hl), d
+        dec hl
+        ld (hl), e
+
+        KERNEL_RAM_MAP()
+    pop hl
+    pop de
+    pop af
+    ret ; Jumps to the syscall routine
+
+_syscall_page_00:
+        ; de = syscall address
+        ; hl = stack position
+        inc hl
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        ex de, hl
+
+        ; Set syscall address
+        ld (hl), d
+        dec hl
+        ld (hl), e
+    pop hl
+    pop de
+    pop af
+    inc sp \ inc sp \ inc sp ; Don't need to reserved space
+    ret
+
+    ; Set as the return address for the function to restore the original page in
+    ; memory bank A.
+_syscall_return:
+    ; Stack: page, ret addr
+    ex (sp), hl ; l, h, ret MSB ; h = ret LSB, l = page
+    push af ; af, l, h, ret MSB
+        ld a, l
+        out (PORT_MEM_BANK_A), a
+        KERNEL_RAM_UNMAP()
+    pop af ; l, h, ret MSB
+    ex (sp), hl ; page, ret addr
+    inc sp ; ret addr
+    ret
+; }}}
+
+
+;; Adjust offsets for process-local calls/jumps/loads.
+; These borrow an idea from KnightOS to make process code position-independent.
+; Depending on whether the literal value following this is in bank A or C, the
+; location of the text or program data section will be added to it (after
+; treating the value as relative to the start of its page. After execution, it
+; will modify the address to reflect the actual address, making the code
+; position-dependent for its current location. It also replaces the restart
+; which triggered it with a nop instruction so that the adjustment only made the
+; first time the code is executed.
+;
+; If this is executed from ROM, it will have no effect (and so would not work).
+;
+lld_handler: ; {{{
+    push af
+    push bc
+    push de
+    push hl
+
+        ; hl = return address
+        ld hl, 8
+        add hl, sp
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+
+        dec hl
+        ld (hl), $00 ; nop
+
+        ; Skip over instruction prefixes
+        ; These are CB, DD, ED, and FD
+        inc hl
+        ld a, (hl)
+        cp $CB
+        jr z, _
+        cp $DD
+        jr z, _
+        cp $ED
+        jr z, _
+        cp $FD
+        jr nz, ++_
+_:
+        ; Move over prefix
+        inc hl
+_:
+        ; Move over instruction
+        inc hl
+
+        ; bc = value
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+        ex de, hl
+        ; (de) = value address
+
+        ; Bank A has the upper bits 01, bank C has 11, we want 00
+        res 6, b
+        bit 7, b
+        jr nz, _lld_data
+_lld_text:
+        ld a, proc_ent_text_addr
+        jr _
+
+_lld_data:
+        res 7, b
+        ld a, proc_ent_prog_data_addr
+        ; jr _
+
+_:
+        ld hl, (cur_process)
+        add a, l
+        ld l, a
+        jr nc, _ \ inc h \_:
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        add hl, bc
+        ex de, hl
+        ; de = adjusted value
+        ; (hl) = value address
+
+        ld (hl), d
+        dec hl
+        ld (hl), e
+    pop hl
+    pop de
+    pop bc
+    pop af
+    ret
+; }}}
+

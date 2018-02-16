@@ -1,0 +1,180 @@
+;
+; dirent.z80
+;
+; Directory reading functions
+;
+
+.nolist
+#include "dirent.inc"
+.list
+
+;; Opens a directory stream.
+; Parameters:
+;   (de) - Path of the directory to open.
+; Return:
+;   c flag - Reset if the directory stream was opened successfully, set if not.
+;   (hl) - DIR structure storing the stream.
+; Preserves:
+;   ix
+;
+opendir: ; {{{
+    call resolve_path
+    ret c ; With whatever error resolve_path set
+    ; hl = dir inode
+
+    call fs_get_mode ; Preserves hl
+    jr c, _opendir_enotdir
+
+    ; Make sure it's a directory
+    ld a, b ; Type is in MSB
+    and S_IFMT >> 8
+    cp S_IFDIR >> 8
+    jr nz, _opendir_eacces
+
+    ; Allocate the structure on the heap
+    push hl
+        ld bc, sizeof_DIR
+        call malloc
+    pop de ; Inode
+    jr c, _opendir_enomem
+
+    ; DIR_inode = 0
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    inc hl
+    ; DIR_offset = 2
+    ld (hl), 0
+    inc hl
+    ld (hl), 0
+    ; No need to initialize the dirent
+
+    ; Back to the start
+    dec hl \ dec hl \ dec hl
+    ; or a
+    ret
+
+_opendir_eacces:
+    ld hl, EACCES
+    jr _
+_opendir_enotdir:
+    ld hl, ENOTDIR
+    jr _
+_opendir_enomem:
+    ld hl, ENOMEM
+    ; jr _
+_:
+    jp proc_set_errno
+
+; }}}
+
+
+;; Closes a directory stream.
+; Parameters
+;   (hl) - Directory stream.
+;
+closedir: ; {{{
+    ; Just free it
+    jp free
+; }}}
+
+
+;; Reads the next entry in a directory stream.
+; Parameters:
+;   (hl) - Directory stream.
+; Return:
+;   c flag - Reset on success, set on failure or if there are no more entries.
+;   (de) - direntry structure with the information.
+; Preserves:
+;   hl, ix
+;
+readdir: ; {{{
+    ; DIR_inode = 0
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    inc hl
+    ; DIR_offset = 2
+    ld c, (hl)
+    inc hl
+    ld b, (hl)
+    inc hl
+    ; DIR_dirent = 4
+    ex de, hl
+    push de
+        call fs_next_direntry
+    pop de
+    jr nc, _
+    ; Restore hl on error
+    ex de, hl
+    dec hl \ dec hl \ dec hl \ dec hl ; Does not affect flags
+    ret
+_:
+
+    ; Increment the index
+    ld h, d \ ld l, e
+    dec hl
+    dec hl
+    inc (hl)
+    inc hl
+    jr nz, _
+    inc (hl)
+_:
+    ; Move back to the start
+    dec hl \ dec hl \ dec hl
+    ret
+; }}}
+
+
+;; Re-initializes a directory stream to the current state of its directory.
+; Parameters:
+;   (hl) - Directory stream.
+; Preserves:
+;   a, bc, de, hl, ix, iy
+;
+rewinddir: ; {{{
+    ld bc, 0
+    jp seekdir
+; }}}
+
+
+;; Gets the current position of a directory stream.
+; The position should only be used with seekdir() as it may not be a direct
+; offset.
+; Parameters:
+;   (hl) - Directory stream.
+; Return:
+;   bc - Current position of the stream.
+; Preserves:
+;   a, de, hl, ix, iy
+;
+telldir: ; {{{
+    ; DIR_offset = 2
+    inc hl \ inc hl
+    ld c, (hl)
+    inc hl
+    ld b, (hl)
+    dec hl \ dec hl \ dec hl
+    ret
+; }}}
+
+
+;; Sets the current position of a directory stream.
+; The position should only be one returned from telldir() with the same stream,
+; as it may not be a direct offset.
+; Parameters:
+;   (hl) - Directory stream.
+;   bc - New position to set.
+; Preserves:
+;   a, bc, de, hl, ix, iy
+;
+seekdir: ; {{{
+    ; DIR_offset = 2
+    inc hl \ inc hl
+    ld (hl), c
+    inc hl
+    ld (hl), b
+    dec hl \ dec hl \ dec hl
+    ret
+; }}}
+

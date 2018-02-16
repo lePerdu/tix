@@ -1,0 +1,289 @@
+;
+; page00.z80
+;
+; Code/data for ROM page 00. This includes the boot code, a jump table for
+; system calls, and some low-level system calls.
+;
+
+.nolist
+#include "fcntl.inc"
+#include "flash.inc"
+#include "ports.inc"
+#include "priv.inc"
+#include "stat.inc"
+#include "tix.inc"
+#include "utils.inc"
+.list
+
+.org $0000
+
+    jr boot
+; Without these, SPASM will not fill space between ".org" directives.
+.fill $0008 - $
+; rst $08
+    jp syscall_handler
+
+.fill $0010 - $
+; rst $10
+    jp lld_handler
+
+.fill $0018 - $
+; rst $18
+    ret
+
+.fill $0020 - $
+; rst $20
+    ret
+
+.fill $0028 - $
+; rst $28
+    ret
+
+.fill $0030 - $
+; rst $30
+
+;; Waits until the LCD is ready to receive another command/read/write after
+;; a command/write (like LCD_BUSY_QUICK in TIOS).
+; This can be called via rst rLCD_DELAY.
+;
+lcd_delay:
+    push af
+_:
+        in a, (PORT_LCD_COM)
+        rla ; Bit 7 is set if busy
+        jr c, -_
+    pop af
+    ret
+#if $ > $0038
+    .error "lcd_wait routine is too long."
+#endif
+
+.fill $0038 - $
+; rst $38
+    ;; Interrupt mode 1 handler
+    ; Swap to shadow registers here so that the sys_interrupt can be jumped to
+    ; on its own if desired.
+    ex af, af'
+    exx
+    jp sys_interrupt
+
+.fill $0053 - $
+; Entry point from TI's boot code
+    jr boot
+
+.fill $0056 - $
+; Part of validation by TI's boot code
+.dw $A55A
+
+boot:
+    ; TODO Initialize more ports more correctly
+
+    di
+    im 1
+
+    ; Put into 15 MHz mode
+    ld a, $01
+    out (PORT_CPU_SPEED), a
+
+    ; Map memory: (none of it really matters execpt the kernel RAM)
+    ;   A - RAM start
+    ;   B - Kernel RAM page
+    ;   C - RAM start
+    ;   kernel RAM - partially mapped to B
+    ld a, RAM_PAGE_START
+    out (PORT_MEM_BANK_A), a
+    out (PORT_MEM_BANK_C), a
+    ;ld a, KERNEL_RAM_PAGE
+    inc a
+    out (PORT_MEM_BANK_B), a
+    KERNEL_RAM_MAP()
+
+    ; Put the stack in kernel_tmp
+    ld sp, kernel_tmp_end
+
+    ; Initialize privileged ports.
+    ; Currently opens all RAM and ROM to execution.
+    privcall unlock_flash_
+
+    xor a
+    out (PORT_RAM_EXEC_LOWER), a
+    dec a
+    out (PORT_RAM_EXEC_UPPER), a
+
+    xor a
+    out (PORT_ROM_EXEC_MSB), a
+    out (PORT_ROM_EXEC_UPPER), a
+    dec a
+    out (PORT_ROM_EXEC_LOWER), a
+
+    privcall lock_flash_
+
+    call lcd_init
+    call lcd_clear
+
+    ; Zero-out file table
+    ld hl, file_table
+    ld de, sizeof_filtab_ent
+    ld b, SYS_OPEN_MAX
+    xor a
+_:
+    ; filtab_ent_flags = 0
+    ld (hl), a
+    inc hl
+    djnz -_
+
+    ; Set input buffer bounds
+    xor a
+    ld (term_input_start), a
+    ld (term_input_end), a
+
+    ; Fill key states to be up
+    ld a, $FF
+    ld hl, key_states_map
+    ld b, KEY_GROUP_COUNT
+_:
+    ld (hl), a
+    inc hl
+    djnz -_
+
+    ; set 2ND and ALPHA to be up
+    xor a
+    ld (key_states_special), a
+
+    ld a, TERM_STATE_CURSOR_ENABLED
+    ld (term_state), a
+
+    ld a, ICRNL
+    ld (term_iflag), a
+    ld a, OPOST
+    ld (term_oflag), a
+    ld a, ICANON | ECHO | ECHOE | ECHOK | ECHONL | IEXTEN
+    ld (term_lflag), a
+
+    ; Set text position
+    xor a
+    ld (text_row), a
+    ld (text_col), a
+    ld (text_z_off), a
+    ld a, TEXT_FONT3X5
+    ld (text_flags), a
+
+    ld a, HWTIMER_BIT1 | HWTIMER_BIT2
+    out (PORT_MAP_TIMER_BAT), a
+
+    ld a, INT_MASK_ON | INT_MASK_TIMER1 | INT_MASK_TIMER2 | INT_OFF_ON_HALT
+    out (PORT_INT_MASK), a
+
+    ; Crystal timer 1 set to 0.5 Hz for the cursor
+    ld a, $47 ; 8 Hz
+    out (PORT_CRYS1_FREQ), a
+    ld a, CRYS_LOOP_ENABLE | CRYS_LOOP_INT
+    out (PORT_CRYS1_LOOP), a
+    ld a, 4 ; 4 Iterations
+    out (PORT_CRYS1_COUNTER), a
+
+    ; Initialize the allocation nodes
+    ; TODO Put this malloc.z80
+
+    ld b, RAM_PAGE_END - RAM_PAGE_START + 1
+    ld a, RAM_PAGE_END
+_:
+    out (PORT_MEM_BANK_B), a
+    ld hl, MEM_BANK_B_ADDR
+    ld (hl), ($4000 - sizeof_galloc_node) & $FF
+    inc hl
+    ld (hl), ($4000 - sizeof_galloc_node) >> 8 | ALLOC_NODE_EMPTY
+    inc hl
+    ld (hl), 0
+    inc hl
+    ld (hl), 0
+    inc hl
+    ld (hl), 0
+
+    ld hl, MEM_BANK_C_ADDR - sizeof_galloc_node
+    ld (hl), 0
+    inc hl
+    ld (hl), 0
+    inc hl
+    ld (hl), ($4000 - sizeof_galloc_node) & $FF
+    inc hl
+    ld (hl), ($4000 - sizeof_galloc_node) >> 8 | ALLOC_NODE_EMPTY
+    inc hl
+    ld (hl), 0
+
+    dec a
+    djnz -_
+
+    ; Allocate kernel memory. This is done statically since it has to be on page
+    ; 01, not 00
+    ld a, KERNEL_RAM_PAGE
+    out (PORT_MEM_BANK_B), a
+    ld iy, MEM_BANK_B_ADDR
+    ld bc, KERNEL_RAM_SIZE + sizeof_galloc_node
+    call alloc_split_
+
+    call fs_read_init
+    jr nc, _
+    ; TODO Show error (and possible not format the filesystem if this fails).
+    call fs_format
+_:
+
+    call proc_init_all
+    call proc_init_pid1
+
+    ; Initialize stdin, stdout, and stderr
+
+    ; stdin (fd 0)
+    ld de, tty_filename
+    ld hl, O_RDONLY
+    syscall open_
+    call c, panic
+
+    ; stdout (fd 1)
+    ld de, tty_filename
+    ld hl, O_WRONLY
+    syscall open_
+    call c, panic
+
+    ; stderr (fd 2)
+    ld de, tty_filename
+    ld hl, O_WRONLY
+    syscall open_
+    call c, panic
+
+    ld ix, init_filename
+    call proc_exec_pid1
+    call panic ; If init does not execute
+
+panic:
+    ; TODO Show debugging information
+    jr $
+    rst $00
+
+init_filename:
+    .db "/bin/init",0
+tty_filename:
+    .db "/dev/tty",0
+
+
+#include "syscall.z80"
+#include "device.z80"
+#include "dirent.z80"
+#include "display.z80"
+#include "fildes.z80"
+#include "file_io.z80"
+#include "filesystem.z80"
+#include "flash.z80"
+#include "font.z80"
+#include "graphics.z80"
+#include "interrupt.z80"
+#include "malloc.z80"
+#include "permissions.z80"
+#include "process.z80"
+#include "string.z80"
+#include "terminal.z80"
+#include "text.z80"
+#include "unistd.z80"
+
+FLASH_PAGE_END($0000, $00)
+

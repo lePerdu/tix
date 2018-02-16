@@ -1,0 +1,373 @@
+;
+; interrupt.z80
+;
+; Interrupt routes
+;
+
+#include "keys.inc"
+#include "memmap.inc"
+#include "text.inc"
+
+;; System interrupt handler.
+; This does a couple things:
+;   - Checks if any keys are down/have changed to log them in the terminal input
+;   buffer.
+;   - Changes the active process when necessary.
+;   - 
+;
+; It is expected that shadow registers are swapped before jumping to this
+; function, and it swaps them back afterward. This is to facilitate custom
+; interrupt handlers which execute before this and want to jump to it without
+; swapping shadow registers. Since shadow registers are used here, any
+; user-space program making use of them shoulld disable interrupts before doing
+; so.
+;
+sys_interrupt: ; {{{
+    ; TODO Only map kernel RAM for interrupt handlers which need it
+    in a, (PORT_RAM_01_MAP)
+    push af
+        KERNEL_RAM_MAP()
+
+        ; Find out which interrupt fired
+        in a, (PORT_INT_SOURCE)
+        bit BIT_INT_SRC_ON, a
+        jr nz, _interrupt_on
+        bit BIT_INT_SRC_TIMER1, a
+        jr nz, _interrupt_timer1
+        bit BIT_INT_SRC_TIMER2, a
+        jr nz, _interrupt_timer2
+        bit BIT_INT_SRC_LINK, a
+        jr nz, _interrupt_link
+        bit BIT_INT_SRC_CRYS1, a
+        jr nz, _interrupt_crys1
+        bit BIT_INT_SRC_CRYS2, a
+        jr nz, _interrupt_crys2
+        bit BIT_INT_SRC_CRYS3, a
+        jr nz, _interrupt_crys3
+
+_interrupt_on:
+        ld a, INT_ACK_ON
+        out (PORT_INT_ACK), a
+        ld a, INT_MASK_TIMER1 | INT_MASK_TIMER2 | INT_OFF_ON_HALT
+        out (PORT_INT_MASK), a
+        ld a, INT_MASK_ON | INT_MASK_TIMER1 | INT_MASK_TIMER2 | INT_OFF_ON_HALT
+        out (PORT_INT_MASK), a
+
+        jp _interrupt_end
+
+        ; Context switch
+_interrupt_timer1:
+        ; TODO Fix TilEm to ACK interrupts with port 2
+        ld a, INT_ACK_TIMER1
+        out (PORT_INT_ACK), a
+        ld a, INT_MASK_ON | INT_MASK_TIMER2 | INT_OFF_ON_HALT
+        out (PORT_INT_MASK), a
+        ld a, INT_MASK_ON | INT_MASK_TIMER1 | INT_MASK_TIMER2 | INT_OFF_ON_HALT
+        out (PORT_INT_MASK), a
+
+    pop af
+    out (PORT_RAM_01_MAP), a
+
+    ex af, af'
+    exx
+    jp proc_ctx_switch
+
+        ; Key input
+_interrupt_timer2:
+        ld a, INT_ACK_TIMER2
+        out (PORT_INT_ACK), a
+        ld a, INT_MASK_ON | INT_MASK_TIMER1 | INT_OFF_ON_HALT
+        out (PORT_INT_MASK), a
+        ld a, INT_MASK_ON | INT_MASK_TIMER1 | INT_MASK_TIMER2 | INT_OFF_ON_HALT
+        out (PORT_INT_MASK), a
+
+        call _int_get_input
+        jr _interrupt_end
+
+_interrupt_link:
+        ld a, INT_ACK_LINK
+        out (PORT_INT_ACK), a
+        ld a, INT_MASK_ON | INT_MASK_TIMER1 | INT_MASK_TIMER2 | INT_OFF_ON_HALT
+        out (PORT_INT_MASK), a
+        jr _interrupt_end
+
+        ; Cursor flash
+_interrupt_crys1:
+        ld a, CRYS_LOOP_ENABLE | CRYS_LOOP_INT
+        out (PORT_CRYS1_LOOP), a
+
+        call _int_flash_cursor
+
+        jr _interrupt_end
+
+_interrupt_crys2:
+        ld a, CRYS_LOOP_ENABLE | CRYS_LOOP_INT
+        out (PORT_CRYS2_LOOP), a
+        jr _interrupt_end
+
+_interrupt_crys3:
+        ld a, CRYS_LOOP_ENABLE | CRYS_LOOP_INT
+        out (PORT_CRYS3_LOOP), a
+        ; jr _interrupt_end
+
+_interrupt_end:
+    pop af
+    out (PORT_RAM_01_MAP), a
+
+    exx
+    ex af, af'
+    ei
+    ret
+; }}}
+
+
+;; Flashes the cursor.
+;
+_int_flash_cursor: ; {{{
+    ; TODO Store the cursor state in a better place
+    ld a, (term_state)
+    and TERM_STATE_CURSOR_ON
+    jr z, _
+    push iy
+        call text_cursor_off
+        ; TODO Don't copy the whole buffer
+        call text_copy_buf
+    pop iy
+    ret
+_:
+    push iy
+        call text_cursor_on
+        ; TODO Don't copy the whole buffer
+        call text_copy_buf
+    pop iy
+    ret
+; }}}
+
+
+;; Checks the states of all keys and compares them with the last saved states,
+;; only triggering the keys if they are pressed (not while they stay pressed).
+;
+_int_get_input: ; {{{
+    ; Set iy to the key table for the states of shift and alpha. This looks at
+    ; the last saved states, which is probably close enough (the timer frequency
+    ; can be increased if necessary).
+    push iy
+        ld iy, key_char_map
+        ld a, (key_states_special)
+        bit BIT_KEY_STATE_SPECIAL_ALPHA, a
+        jr z, _
+        ld de, key_char_map_alpha - key_char_map
+        add iy, de
+_:
+        bit BIT_KEY_STATE_SPECIAL_2ND, a
+        jr z, _
+        ld de, key_char_map_2nd - key_char_map
+        add iy, de
+_:
+
+        ; Check all keys and compares them with the states saved last iteration.
+        ; When
+        ld e, 7 ; Use e as the outer loop counter
+        ld c, PORT_KEYPAD
+        ld d, KEY_GROUP7 ; Store the group here
+        ld hl, key_states_map + 7 - 1 ; Start at group 7
+_igi_group_loop: ; {{{
+        ld a, KEY_GROUP_RESET
+        out (PORT_KEYPAD), a
+        ; TODO Delay between these?
+        out (c), d
+
+        ; Mask to reset bits which are reset now but set before: src | ~dst
+        ld a, (hl)
+        cpl
+        in b, (c)
+        ld (hl), b ; Store the current value
+        or b
+        ; Each key corresponding to each reset bit in a is considered pressed
+
+        ; No keys down in the group
+        cp $FF
+        jp z, _igi_no_keypress
+
+        ld b, 8
+_igi_key_loop: ; {{{
+        ; Since the counter moves in reverse, the keys also have to be traversed
+        ; in reverse (i.e. higher bits first)
+        sla a ; bit 7 -> carry
+        jp c, _igi_kl_next
+
+        ; {{{ process keypress
+        push af
+            ld a, e
+            cp 1 ; Group 1
+            jr z, _igi_kl_group1
+            cp 2 ; Group 2
+            jr nz, _igi_kl_regkey
+
+_igi_kl_group2:
+            ld a, b
+            cp BIT_KEY_ALPHA + 1
+            jr nz, _igi_kl_regkey
+            push bc
+            push de
+            push hl
+                call text_cursor_off
+
+                ld a, (key_states_special)
+                bit BIT_KEY_STATE_SPECIAL_ALPHA_LOCK, a
+                jr z, _
+                ; If ALPHA lock on, reset both bits
+                and ~KEY_STATE_SPECIAL_ALPHA_LOCK & ~KEY_STATE_SPECIAL_ALPHA & $FF
+                jr ++_
+_:
+                xor KEY_STATE_SPECIAL_ALPHA ; Toggle no matter what
+                bit BIT_KEY_STATE_SPECIAL_ALPHA, a
+                ; If not set, it was before, so turn on ALPHA lock
+                jr nz, _
+                ; Set (back) both
+                or KEY_STATE_SPECIAL_ALPHA_LOCK | KEY_STATE_SPECIAL_ALPHA
+_:
+                ld (key_states_special), a
+
+                call text_cursor_on
+            pop hl
+            pop de
+            pop bc
+            jr _igi_kl_finish
+_igi_kl_group1:
+            ld a, b
+            cp BIT_KEY_2ND + 1
+            jr nz, _igi_kl_regkey
+            push bc
+            push de
+            push hl
+                call text_cursor_off
+
+                ld a, (key_states_special)
+                bit BIT_KEY_STATE_SPECIAL_2ND_LOCK, a
+                ; If 2ND lock on, reset both bits
+                jr z, _
+                and ~KEY_STATE_SPECIAL_2ND_LOCK & ~KEY_STATE_SPECIAL_2ND & $FF
+                jr ++_
+_:
+                xor KEY_STATE_SPECIAL_2ND ; Toggle no matter what
+                bit BIT_KEY_STATE_SPECIAL_2ND, a
+                ; If not set, it was before, so turn on 2ND lock
+                jr nz, _
+                ; Set (back) both
+                or KEY_STATE_SPECIAL_2ND_LOCK | KEY_STATE_SPECIAL_2ND
+_:
+                ld (key_states_special), a
+
+                call text_cursor_on
+            pop hl
+            pop de
+            pop bc
+            jr _igi_kl_finish
+
+_igi_kl_regkey:
+            ; If ALPHA/2ND lock is not on, reset the bits
+            ld a, (key_states_special)
+            bit BIT_KEY_STATE_SPECIAL_ALPHA_LOCK, a
+            jr nz, _
+            and ~KEY_STATE_SPECIAL_ALPHA & $FF
+_:
+            bit BIT_KEY_STATE_SPECIAL_2ND_LOCK, a
+            jr nz, _
+            and ~KEY_STATE_SPECIAL_2ND & $FF
+_:
+            ; No need to turn off the cursor here because the character is sent
+            ; to the terminal, which will toggle the cursor if necessary
+            ; TODO This may need to change
+            ld (key_states_special), a
+
+            push iy \ ex (sp), hl ; push hl \ ld hl, iy
+                ;  a = 8*(e-1) + b-1 (won't overflow since e,b <= 8)
+                ld a, e
+                dec a
+                add a, a
+                add a, a
+                add a, a
+                add a, b
+                dec a
+
+                add a, l
+                ld l, a
+                ld a, 0
+                adc a, h
+                ld h, a
+
+                ld a, (hl)
+                cp $FF
+                ; $FF means no character
+                jr z, _
+                push bc
+                push de
+                    call terminal_input
+                pop de
+                pop bc
+_:
+                ; TODO Check for error? If so, do what?
+            pop hl
+_igi_kl_finish:
+        pop af
+        ; }}}
+
+_igi_kl_next:
+        ; TODO Make this distance shorter
+        dec b
+        jp nz, _igi_key_loop
+        ; }}}
+
+_igi_no_keypress:
+        dec hl
+        rlc d
+        dec e
+        jp nz, _igi_group_loop
+        ; }}}
+
+    pop iy
+    ret
+; }}}
+
+
+key_char_map:
+    .db $FF, $FF, $FF, $FF, '=', $FF, $FF, CHAR_DEL
+    .db $FF, 'x', 's', 'n', 'i', 'd', 'a', $FF
+    .db ' ', 'y', 't', 'o', 'j', 'e', 'b', $FF
+    .db ':', 'z', 'u', 'p', 'k', 'f', 'c', $FF
+    .db '?', '@', 'v', 'q', 'l', 'g', $FF, $FF
+    .db '\n','"', 'w', 'r', 'm', 'h', CHAR_BS, $FF
+    .db CHAR_DOWN, CHAR_LEFT, CHAR_RIGHT, CHAR_UP, $FF, $FF, $FF, $FF
+key_char_map_2nd:
+    .db $FF, $FF, $FF, $FF, $FF, $FF, CHAR_ESC, CHAR_DEL
+    .db $FF, $FF, $FF, $FF, $FF, $FF, '#', $FF
+    .db '0', '1', '4', '7', ',', '|', '%', $FF
+    .db '.', '2', '5', '8', '(', '<', '&', $FF
+    .db '_', '3', '6', '9', ')', '>', $FF, $FF
+    .db '\n','+', '-', '*', '/', '^', CHAR_KILL, $FF
+    .db CHAR_DOWN, CHAR_LEFT, CHAR_RIGHT, CHAR_UP, $FF, $FF, $FF, $FF
+    ; .db $FF, $FF, $FF, $FF, $FF, $FF, $FF, $7F
+    ; .db $FF, $18, $15, $10, $0B, $06, $01, $FF
+    ; .db $00, $19, $16, $11, $0C, $07, $02, $FF
+    ; .db $FF, $1A, $17, $12, $0D, $08, $03, $FF
+    ; .db $37, $FF, $13, $0E, $09, $04, $FF, $FF
+    ; .db $1B, $FF, $14, $0F, $0A, $05, $08, $FF
+    ; .db $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF
+key_char_map_alpha:
+    .db $FF, $FF, $FF, $FF, $FF, $FF, CHAR_EOF, CHAR_DEL
+    .db $FF, 'X', 'S', 'N', 'I', 'D', 'A', $FF
+    .db '\t','Y', 'T', 'O', 'J', 'E', 'B', $FF
+    .db ';', 'Z', 'U', 'P', 'K', 'F', 'C', $FF
+    .db '!', '$', 'V', 'Q', 'L', 'G', $FF, $FF
+    .db '\n','\'','W', 'R', 'M', 'H', CHAR_BS, $FF
+    .db CHAR_DOWN, CHAR_LEFT, CHAR_RIGHT, CHAR_UP, $FF, $FF, $FF, $FF
+key_char_map_2nd_alpha:
+    .db $FF, $FF, $FF, $FF, $FF, $FF, CHAR_NUL, CHAR_DEL
+    .db $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF
+    .db $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF
+    .db $FF, $FF, $FF, $FF, '{', $FF, $FF, $FF
+    .db '~', $FF, $FF, $FF, '}', $FF, $FF, $FF
+    .db '\n','`', ']', '[', '\\',$FF, CHAR_KILL, $FF
+    .db CHAR_DOWN, CHAR_LEFT, CHAR_RIGHT, CHAR_UP, $FF, $FF, $FF, $FF
+

@@ -1,0 +1,424 @@
+;
+; flash.z80
+;
+; Functions for modifying flash ROM.
+;
+
+.nolist
+#include "flash.inc"
+#include "ports.inc"
+#include "priv.inc"
+#include "tix.inc"
+#include "utils.inc"
+.list
+
+;; Writes a single byte to flash.
+; The flash page can be in any memory bank (except C, since it can only store
+; RAM pages). This does not make sure that the memory bank is set to a flash
+; page, so be careful, as otherwise the write sequence could overwrite other
+; data in RAM. This does make sure that the byte can be written before
+; performing the operation.
+;
+; Parameters:
+;   a - The byte to write.
+;   (hl) - The location to write to.
+; Return:
+;   c flag - Reset if the byte could be written (does not try to write a 1 over a
+;   0), set if it could not.
+; Preserves:
+;   b, hl, ix, iy
+;
+flash_write_byte:
+    ld c, a
+    ld a, (hl)
+    cpl
+    and c
+    jr z, _
+    scf
+    ret
+_:
+    ; TODO Don't continually rewrite the code (and possibly use the same code as
+    ; flash_write_buf).
+    push bc
+    push hl
+        ld hl, _fwbyte_ram_code
+        ld de, flash_code
+        ld bc, _fwbyte_ram_code_end - _fwbyte_ram_code
+        ldir
+    pop hl
+    pop bc
+
+    syscall unlock_flash_
+    call flash_code
+    ex af, af' ; Preserve the status
+    syscall lock_flash_
+    ex af, af'
+    or a
+    ret
+
+;; Routine copied to RAM to perform the operation.
+; Parameters:
+;   c - Byte to write.
+;   (hl) - Address to write to.
+_fwbyte_ram_code:
+relocate(flash_code)
+    ld a, $AA
+    ld ($4AAA), a
+    ld a, $55
+    ld ($4555), a
+    ld a, $A0
+    ld ($4AAA), a
+
+    ld a, c
+    ld (hl), a
+_fwbyte_rc_poll:
+    ; Poll until the write is finished.
+    ; If bit 5 of dst is reset, the write is in progress.
+    ; This is when bit 7 of dst and src are equal.
+    ld a, (hl)
+    xor c
+    bit 7, a
+    ret z
+    bit 5, (hl)
+    jr z, _fwbyte_rc_poll
+    ; TODO KnightOS does another check here. Need to find more information on
+    ; the flash chip to see what exactly to do.
+_fwbyte_rc_abort:
+    ld a, $F0
+    ld ($0000), a
+    scf
+_fwbyte_rc_done:
+    ret
+endrelocate()
+_fwbyte_ram_code_end:
+#if _fwbyte_ram_code_end - _fwbyte_ram_code > FLASH_CODE_SIZE
+    .error "_fwbyte_ram_code is ", _fwbyte_ram_code_end - _fwbyte_ram_code - FLASH_CODE_SIZE, " too large."
+#endif
+
+;; Copies a buffer of data into flash.
+; This first verifies that every byte in the source data can be written to the
+; destination (i.e. no 1s are written over 0s).
+;
+; Parameters:
+;   (hl) - The data to copy.
+;   (de) - The location to copy to in flash.
+;   bc - The number of bytes to copy.
+; Return: (similar to ldir)
+;   c flag - Set if the data could not be copied. In this case, the parameters
+;   are left unchanged.
+;   (hl) - 1 after the end of the data to copy.
+;   (de) - 1 after the end of the copy of the data.
+;   bc - 0
+; Preserves:
+;   ix, iy
+;   The states of hl and de are partially reserved as described above
+;
+flash_write_buf:
+    push bc
+    push de
+    push hl
+_fwbuf_check:
+        ld a, (de)
+        cpl
+        and (hl)
+        jr z, _
+    pop hl
+    pop de
+    pop bc
+    scf
+    ret
+_:
+        inc hl
+        inc de
+        dec bc
+        ld a, b
+        or c
+        jr nz, _fwbuf_check
+
+        ; TODO Don't rewrite the code at each call (and possibly use the same code
+        ; as flash_write_buf).
+        ld hl, _fwbuf_ram_code
+        ld de, flash_code
+        ld bc, _fwbuf_ram_code_end - _fwbuf_ram_code
+        ldir
+    pop hl
+    pop de
+    pop bc
+
+    syscall unlock_flash_
+    call flash_code
+    ex af, af' ; Preserve the status
+    syscall lock_flash_
+    ex af, af'
+    or a
+    ret
+
+_fwbuf_ram_code:
+relocate(flash_code)
+    ex de, hl
+_fwbuf_rc_loop:
+    ; Load the data to write first in case it is in flash since the write
+    ; sequence is interrupted by reading from flash.
+    ld a, (de)
+    ex af, af'
+        ld a, $AA
+        ld ($4AAA), a
+        ld a, $55
+        ld ($4555), a
+        ld a, $A0
+        ld ($4AAA), a
+    ex af, af'
+
+    ld (hl), a
+    push bc
+        ld c, a
+_fwbuf_rc_poll:
+        ld b, (hl) ; Might as well use b
+        ; Same process as in flash_write_byte
+        ld a, b
+        xor c
+        bit 7, a
+        jr z, _fwbuf_rc_continue
+        bit 5, b
+        jr z, _fwbuf_rc_poll
+_fwbuf_rc_abort:
+        ld a, $F0
+        ld ($0000), a
+    pop bc
+    scf
+    ret
+
+_fwbuf_rc_continue:
+    pop bc
+
+    inc hl
+    inc de
+    dec bc
+    ld a, b
+    or c
+    jr nz, _fwbuf_rc_loop
+
+    ex de, hl ; Switch back
+    ret
+endrelocate()
+_fwbuf_ram_code_end:
+#if _fwbuf_ram_code_end - _fwbuf_ram_code > FLASH_CODE_SIZE
+    .error "_fwbuf_ram_code is ", _fwbuf_ram_code_end - _fwbuf_ram_code - FLASH_CODE_SIZE, " too large."
+#endif
+
+
+;; Copies a section of a flash page to another page.
+; This first verifies that every byte in the source data can be written to the
+; destination (i.e. no 1s are written over 0s).
+;
+; Parameters:
+;   a - Page to copy from.
+;   (hl) - The data to copy.
+;   (de) - The location to copy to in flash, on the page currently mapped to
+;       bank A.
+;   bc - The number of bytes to copy.
+; Return: (similar to ldir)
+;   c flag - Set if the data could not be copied. In this case, the parameters
+;   are left unchanged.
+;   (hl) - 1 after the end of the data to copy.
+;   (de) - 1 after the end of the copy of the data.
+;   bc - 0
+; Preserves:
+;   ix, iy
+;   The states of hl and de are partially reserved as described above
+;   Memory mapping is not changed
+;
+flash_copy:
+    push bc
+    push de
+    push hl
+        ; Shadow registers are used to store the pages and intermediate
+        ; values since a is the only open register (besides ix and iy)
+        exx
+            ; e = source page
+            ; d = destintation page
+            ld e, a
+            in a, (PORT_MEM_BANK_A)
+            ld d, a
+        exx
+_fcpy_check:
+        ld a, (de)
+        cpl
+
+        ex af, af'
+        exx
+        ld a, d
+        out (PORT_MEM_BANK_A), a
+        ld a, e ; Prepare for switching back
+        exx
+        ex af, af'
+
+        and (hl)
+
+        ex af, af'
+        out (PORT_MEM_BANK_A), a
+        ex af, af'
+
+        jr z, _
+    pop hl
+    pop de
+    pop bc
+    scf
+    ret
+_:
+        inc hl
+        inc de
+        dec bc
+        ld a, b
+        or c
+        jr nz, _fcpy_check
+
+        ; TODO Don't rewrite the code at each call (and possibly use the same code
+        ; as flash_write_buf).
+        ld hl, _fcpy_ram_code
+        ld de, flash_code
+        ld bc, _fcpy_ram_code_end - _fcpy_ram_code
+        ldir
+    pop hl
+    pop de
+    pop bc
+
+    syscall unlock_flash_
+    call flash_code
+    ex af, af' ; Preserve the status
+    syscall lock_flash_
+    ex af, af'
+    or a
+    ret
+
+_fcpy_ram_code:
+relocate(flash_code)
+    ; Swap these so the destination can be read into registers other than a
+    ex de, hl
+_fcpy_rc_loop:
+    ; Load the data to write and swap to the destination page before starting
+    ; the write command sequence
+    exx
+        ; e = source page
+        ld a, e
+        out (PORT_MEM_BANK_A), a
+    exx
+    ld a, (de)
+    ex af, af'
+        exx
+            ; d = destination page
+            ld a, d
+            out (PORT_MEM_BANK_A), a
+        exx
+
+        ld a, $AA
+        ld ($4AAA), a
+        ld a, $55
+        ld ($4555), a
+        ld a, $A0
+        ld ($4AAA), a
+    ex af, af'
+
+    ld (hl), a
+    push bc
+        ld c, a
+_fcpy_rc_poll:
+        ld b, (hl) ; Might as well use b
+        ; Same process as in flash_write_byte
+        ld a, b
+        xor c
+        bit 7, a
+        jr z, _fcpy_rc_continue
+        bit 5, b
+        jr z, _fcpy_rc_poll
+_fcpy_rc_abort:
+        ld a, $F0
+        ld ($0000), a
+    pop bc
+    scf
+    ret
+
+_fcpy_rc_continue:
+    pop bc
+
+    inc hl
+    inc de
+    dec bc
+    ld a, b
+    or c
+    jr nz, _fcpy_rc_loop
+
+    ex de, hl ; Switch back
+    ; Already on the destination page
+    ret
+endrelocate()
+_fcpy_ram_code_end:
+#if _fcpy_ram_code_end - _fcpy_ram_code > FLASH_CODE_SIZE
+    .error "_fcpy_ram_code is ", _fcpy_ram_code_end - _fcpy_ram_code  - FLASH_CODE_SIZE, " too large."
+#endif
+
+
+;; Erases a block of flash.
+; Parameters:
+;   a - A page of the block to erase. This erases all pages in the block,
+;   starting every 4 pages (except for the last 4; TODO handle those pages
+;   separately).
+; Preserves:
+;   ix, iy
+;
+flash_erase:
+    and %11111100
+    ld hl, _fe_ram_code
+    ld de, flash_code
+    ld bc, _fe_ram_code_end - _fe_ram_code
+    ldir
+
+    out (PORT_MEM_BANK_A), a
+
+    ld hl, MEM_BANK_A_ADDR
+
+    syscall unlock_flash_
+    call flash_code
+    ex af, af' ; Preserve the status
+    syscall lock_flash_
+    ex af, af'
+    or a
+    ret
+
+_fe_ram_code:
+relocate(flash_code)
+    ld a, $AA
+    ld ($4AAA), a
+    ld a, $55
+    ld ($4555), a
+
+    ld a, $80
+    ld ($4AAA), a
+
+    ld a, $AA
+    ld ($4AAA), a
+    ld a, $55
+    ld ($4555), a
+
+    ld a, $30
+    ld (hl), a
+
+    or a ; TODO This may not be necessary
+_fe_rc_poll:
+    ld a, (hl)
+    bit 7, a
+    ret nz
+    bit 5, a
+    jr z, _fe_rc_poll
+_fe_rc_abort:
+    ld a, $F0
+    ld (hl), a
+    scf
+    ret
+
+endrelocate()
+_fe_ram_code_end:
+#if _fe_ram_code_end - _fe_ram_code > FLASH_CODE_SIZE
+    .error "_fe_ram_code is ", _fe_ram_code_end - _fe_ram_code - FLASH_CODE_SIZE, " too large."
+#endif
+

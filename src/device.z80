@@ -1,0 +1,306 @@
+;
+; device.z80
+;
+; Functions for working with special devices.
+;
+; TODO This probably needs to be changed a lot.
+; Files representing special devices contain 2 bytes of data:
+;   u8  device type (major type)
+;   u8  device identifier (minor type)
+; When a file description on such a device is created, it reads the data and
+; stores it in place of the inode for subsequent calls to read() and write(),
+; which foreward calls to device_read(), device_write(), and device_append().
+; The device type is used as the index (TODO key?)in a table storing the
+; functions pointers specific to the type, and must be less than $FF. The device
+; identifier is used by those functions to determine the actual device, and can
+; take on any value representable by a single byte.
+;
+; TODO Use the same functions for FIFOs and sockets, giving those pre-defined
+; type (e.g. 0 and 1).
+;
+
+.nolist
+#include "ports.inc"
+.list
+
+
+;; Structure for the device table entries.
+;   u8  read_page - Page of the read function.
+;   u16 read - Address of the read function.
+;   u8  write_page - Page of the write function.
+;   u16 write - Address of the write function.
+;   u8  append_page - Page of the append function.
+;   u16 append_addr - Address of the append function.
+;
+; Read and write functions have prototypes similar to the main read, write, and
+; append functions:
+;   int:bc read(char type:h, void *buf:iy, int size:bc, int offset:de)
+;   int:bc write(char type:h, void *buf:iy, int size:bc, int offset:de)
+;   int:bc append(char type:h, void *buf:iy, int size:bc)
+; For device types which do not support offsets, the write and append functions
+; can be set to the same function.
+;
+device_ent_read_page    .equ 0
+device_ent_read_addr    .equ 1
+device_ent_write_page   .equ 3
+device_ent_write_addr   .equ 4
+device_ent_append_page  .equ 6
+device_ent_append_addr  .equ 7
+
+sizeof_device_ent   .equ 9
+
+; TODO This will probably be moved/indirected
+device_type_table:
+; /dev/null
+    .db $00 \ .dw dev_null_read_
+    .db $00 \ .dw dev_null_write_
+    .db $00 \ .dw dev_null_write_
+; Terminal
+    .db $00 \ .dw terminal_read
+    .db $00 \ .dw terminal_write
+    .db $00 \ .dw terminal_write
+device_type_table_end:
+
+DEVICE_COUNT .equ (device_type_table_end - device_type_table) / sizeof_device_ent
+
+
+;; Gets the device identifier (type and device number) from a file representing
+;; a device.
+; Parameters:
+;   hl - Inode of the device file.
+; Return:
+;   c flag - Reset if the device data was successfully read, set if not.
+;   l - Type of the device.
+;   h - Device number (relative to the type).
+; Preserves:
+;   ix
+;
+device_get_ident: ; {{{
+    ; Make room on the stack to read the data
+    ld iy, -2
+    add iy, sp
+    ld sp, iy
+    ld bc, 2
+    ld de, 0
+    call fs_read_file
+    pop hl ; Read the data off the stack and restore sp
+    ret ; Same status as fs_read_file
+; }}}
+
+
+;; Callback to restore the page after a device read/write handler.
+; TODO Move device handler system calls to another page so that the system call
+; handler will do this for us.
+; Parameters:
+;   (sp) - Old page.
+;   (sp+1) - Return address.
+;
+device_page_restore_: ; {{{
+    ; Stack: page, ret addr
+    ex (sp), hl ; l, h, ret MSB ; h = ret LSB, l = page
+    push af ; af, l, h, ret MSB
+        ld a, l
+        out (PORT_MEM_BANK_A), a
+        KERNEL_RAM_UNMAP()
+    pop af ; l, h, ret MSB
+    ex (sp), hl ; page, ret addr
+    inc sp ; ret addr
+    ret
+; }}}
+
+
+;; Reads data from a device.
+; Parameters:
+;   l - Type of the device.
+;   h - Device number (relative to the type).
+;   de - Offset (only used if the device supports offsets).
+;   bc - Maximum number of bytes to read.
+;   (iy) - Buffer to read into.
+; Return:
+;   c flag - Reset if the read was successful, set if an error occurs.
+;   bc - Number of bytes read.
+; Preserves:
+;   Whatever the device-specific read function preserves.
+;
+; TODO device_{read,write,append} functions are identical except for the offset
+; into the table entry, and could probably be condenced.
+; TODO For all of those, restore the page of bank A (possibly, share code with
+; syscalls).
+;
+device_read: ; {{{
+    ld a, l
+    cp DEVICE_COUNT
+    jr c, _
+    scf
+    ret
+_:
+    in a, (PORT_MEM_BANK_A)
+    push af
+    inc sp ; Don't care about f
+    push hl
+    ld hl, device_page_restore_
+    ex (sp), hl
+
+    push hl
+        ; a *= sizeof_device_ent = 9
+        ; TODO Use hl so this doesn't overflow
+        ld a, l
+        add a, a
+        add a, a
+        add a, a
+        add a, l
+        ld hl, device_type_table + device_ent_read_page
+        add a, l
+        ld l, a
+        jr nc, _
+        inc h
+_:
+
+        ; device_ent_read_page = 0
+        ld a, (hl)
+        out (PORT_MEM_BANK_A), a
+        ; device_ent_read_addr = 1
+        inc hl
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        ; hl = function address
+        ; (sp) = device identifier
+    ex (sp), hl
+    ; hl = device identifier
+    ; (sp) = function address
+
+    ; Jump to function
+    ret
+; }}}
+
+
+;; Writes data to a device.
+; Parameters:
+;   l - Type of the device.
+;   h - Device number (relative to the type).
+;   de - Offset (only used if the device supports offsets).
+;   bc - Number of bytes in the buffer to use.
+;   (iy) - Buffer to read from.
+; Return:
+;   c flag - Reset if the write was successful, set if an error occurs.
+;   bc - Number of bytes written.
+; Preserves:
+;   Whatever the device-specific write function preserves.
+;
+device_write: ; {{{
+    ld a, l
+    cp DEVICE_COUNT
+    jr c, _
+    scf
+    ret
+_:
+    in a, (PORT_MEM_BANK_A)
+    push af
+    inc sp ; Don't care about f
+    push hl
+    ld hl, device_page_restore_
+    ex (sp), hl
+
+    push hl
+        ; a *= sizeof_device_ent = 9
+        ; TODO Use hl so this doesn't overflow
+        ld a, l
+        add a, a
+        add a, a
+        add a, a
+        add a, l
+        ; Go directly to the right (in particular, the write) part
+        ld hl, device_type_table + device_ent_write_page
+        add a, l
+        ld l, a
+        jr nc, _
+        inc h
+_:
+
+        ld a, (hl)
+        out (PORT_MEM_BANK_A), a
+        ; device_ent_write_addr = device_ent_write_page + 1
+        inc hl
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        ; hl = function address
+        ; (sp) = device identifier
+    ex (sp), hl
+    ; hl = device identifier
+    ; (sp) = function address
+
+    ; Jump to function
+    ret
+; }}}
+
+
+;; Appends data to a device.
+; Parameters:
+;   l - Type of the device.
+;   h - Device number (relative to the type).
+;   bc - Number of bytes in the buffer to use.
+;   (iy) - Buffer to read from.
+; Return:
+;   c flag - Reset if the write was successful, set if an error occurs.
+;   bc - Number of bytes written.
+; Preserves:
+;   Whatever the device-specific write function preserves.
+;
+device_append: ; {{{
+    ld a, l
+    cp DEVICE_COUNT
+    jr c, _
+    scf
+    ret
+_:
+    push hl
+        ; a *= sizeof_device_ent = 6
+        add a, a
+        add a, a
+        add a, a
+        add a, l
+        ; Go directly to the append part
+        ld hl, device_type_table + device_ent_append_page
+        add a, l
+        ld l, a
+        ld a, 0
+        adc a, h
+        ld h, a
+
+        ld a, (hl)
+        out (PORT_MEM_BANK_A), a
+        ; device_ent_append_addr = device_ent_append_page + 1
+        inc hl
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        ; hl = function address
+        ; (sp) = device identifier
+    ex (sp), hl
+    ; hl = device identifier
+    ; (sp) = function address
+
+    ; Jump to function
+    ret
+; }}}
+
+
+;; Read and write functions for /dev/null.
+; See device_ent description for the prototypes.
+;
+dev_null_read_: ; {{{
+    ld bc, 0
+    ret
+; }}}
+dev_null_write_: ; {{{
+    ; Leave bc the same
+    ret
+; }}}
+
+
+

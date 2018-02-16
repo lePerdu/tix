@@ -1,0 +1,617 @@
+;
+; fildes.z80
+;
+; Functions for dealing with file descriptors, both per-process and system-wide
+; tables.
+;
+; Some file-based system calls are implemented here (such as close() and dup())
+; but not more complicated ones (e.g. ones dealing with paths).
+;
+
+#include "fildes.inc"
+
+;; Allocates and initializes a new file desecriptor entry in the file table.
+; Parameters:
+;   hl - The inode/device.
+;   bc - The flags. The first byte (LSB) is the fist byte of the flags specified
+;   to open() (the others do not need to be stored). The second byte (MSB) store
+;   the type of the file (S_IF*).
+; Return:
+;   c flag - Set if there are no more available entries, reset if there are and
+;   the file descriptor entry was successful allocated.
+;   a - The index in the file table OR'd with the FD_CLOEXEC flag if set. This
+;   value can be treated without masking as an index into the file table:
+;   filtab_deref takes care of (i.e. ignores) the flag.
+;   [(hl) - The file table entry.]
+; Preserves:
+;   bc, ix, iy
+;
+filtab_open: ; {{{
+    ; Save hl in de (not used for the search)
+    ex de, hl
+    push bc
+        ld hl, file_table
+        ld b, SYS_OPEN_MAX
+_fta_search:
+        ; filtab_ent_inode = 0
+        ld a, (hl)
+        inc hl
+        or (hl)
+        dec hl
+        jr z, _fta_found ; Carry is reset from the or instruction
+
+        ; sizeof_filtab_ent = 8
+        inc hl \ inc hl \ inc hl \ inc hl \ inc hl \ inc hl \ inc hl \ inc hl
+        djnz _fta_search
+
+_fta_not_found:
+    pop bc
+; ex de, hl
+scf
+ret
+
+_fta_found:
+        ; Get the index (a is preserved below)
+        ld a, SYS_OPEN_MAX
+        sub b
+    pop bc
+    ; filtab_ent_inode = 0
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    ; filtab_ent_flags = 2
+    inc hl
+    ld (hl), c
+    inc hl
+    ld (hl), b
+    ; filtab_ent_offset = 4
+    ld e, 0 ; Initialize offset to 0
+    inc hl
+    ld (hl), e
+    inc hl
+    ld (hl), e
+    ; filtab_ent_refs = 6
+    ;ld e, 1
+    inc e
+    inc hl
+    ld (hl), e
+
+    ; Move back to the start (currently at filtab_ent_refs = 6)
+    dec hl \ dec hl \ dec hl \ dec hl \ dec hl \ dec hl
+
+    ; O_CLOEXEC is in the LSB so that it can be passed from open().
+    bit BIT_O_CLOEXEC, c
+    jr z, _
+    or FD_CLOEXEC
+_:
+    or a
+    ret
+; }}}
+
+
+;; Gets the file table entry data from an index into it.
+; Parameters:
+;   a - The index into the file table, excluding the 7th (FD_CLOEXEC) bit.
+; Return:
+;   c flag - Reset if the index is valid and an open file description, set
+;   otherwise.
+;   z flag - Set if the entry is unused, reset otherwise. (only meaningful if
+;   the index is valid).
+;   (hl) - The file table entry, if it exists.
+; Preserves:
+;   bc, de, ix, iy
+;
+filtab_deref: ; {{{
+    ; Mask out FD_CLOEXEC.
+    and ~FD_CLOEXEC & $FF
+    ; Make sure a < SYS_OPEN_MAX
+    cp SYS_OPEN_MAX
+    jr c, _
+    scf
+    ret
+
+_:
+    ; a *= sizeof_filtab_ent = 8
+    add a, a \ add a, a \ add a, a
+    ld hl, file_table
+    add a, l
+    ld l, a
+    ld a, 0
+    adc a, h
+    ld h, a
+
+    ld a, (hl)
+    inc hl
+    or (hl) ; Resets carry; sets zero if empty
+    dec hl ; Does not modify flags
+    ret
+; }}}
+
+
+;; Gets the address of a file descriptor from its index.
+; Parameters:
+;   a - The index.
+; Return:
+;   c flag - Set if the index is invalid, reset otherwise.
+;   z flag - Set if the file descriptor is unused, reset if it is used (only
+;   meaningful if the index is valid).
+;   (hl) - The file descriptor, if the index it is valid.
+; Preserves:
+;   bc, de, ix, iy
+;
+fildes_deref: ; {{{
+    ; Make sure a < OPEN_MAX
+    cp OPEN_MAX
+    jr c, _
+    scf
+    ret
+_:
+    ld hl, (cur_process)
+    ; sizeof_fildes = 1
+    add a, proc_ent_fildes
+    add a, l
+    ld l, a
+    jr nc, $+3 \ inc h
+
+    ld a, (hl)
+    cpl ; Does not affect flags
+    or a ; Resets carry; sets zero if empty (originally set to $FF)
+    cpl
+    ret
+; }}}
+
+
+;; Gets the underlying file table entry from a file descriptor index.
+; Parameters:
+;   a - The index.
+; Return:
+;   c flag - Set if the index is invalid or points to a non-open file
+;   descriptor, reset otherwise.
+;   (hl) - The file table entry.
+; Preserves:
+;   bc, de, ix, iy
+;
+fildes_deref_full: ; {{{
+    call fildes_deref
+    jr nz, _
+    scf
+_:
+    ret c
+
+    ld a, (hl)
+    jp filtab_deref
+; }}}
+
+
+;; Finds the next unused file descriptor after a certain index.
+; Parameters:
+;   a - Index to start from.
+; Return:
+;   c flag - Reset if an unused file descritor is found; reset if there are none
+;   available after the specified index.
+;   (hl) - The unused file descriptor.
+;   a - Index of the unused file descriptor.
+; Preserves:
+;   de, ix, iy
+;
+fildes_find_after: ; {{{
+    ld c, a ; Save (also used for return)
+    ld a, OPEN_MAX
+    sub c
+    ret c
+    ld b, a ; Counter
+    ld a, c ; Restore
+
+    ld hl, (cur_process)
+    ; sizeof_fildes = 1
+    add a, proc_ent_fildes
+    add a, l
+    ld l, a
+    jr nc, $+3 \ inc h
+
+    ld a, $FF
+_fdff_search:
+    cp (hl)
+    jr nz, _
+    ld a, c
+    ret ; Carry reset if zero is set
+_:
+
+    inc hl
+    inc c
+    djnz _fdff_search
+
+    scf
+    ret
+
+; }}}
+
+
+;; Allocates a file descriptor for the current process at the lowest available
+;; index.
+; Parameters:
+;   hl - The inode/device.
+;   bc - The flags.
+; Return:
+;   c flag - Set if there are no more file descriptors available, reset
+;   otherwise.
+;   a - The index of the file descriptor.
+; Preserves:
+;   bc, ix, iy
+;
+fildes_open: ; {{{
+    ld a, 0
+    ;jp fildes_open_after
+; }}}
+
+
+;; Allocates a file descriptor for the current process at an index at or above a
+;; specified index.
+; Parameters:
+;   a - The minimum file descriptor index.
+;   hl - The inode/device.
+;   bc - The flags.
+; Return:
+;   c flag - Set if there are no more file descriptors available at or above the
+;   index, reset otherwise.
+;   a - The index of the file descriptor.
+; Preserves:
+;   bc, ix, iy
+;
+fildes_open_after: ; {{{
+    ex de, hl ; Save hl in de
+    push bc
+        call fildes_find_after
+    pop bc
+    ret c
+
+    ex de, hl
+    ; hl = inode
+    ; (de) = fd
+    ; a = fd index
+
+    push af
+        push de
+            call filtab_open
+        pop de
+        jr nc, _
+    pop af
+    ret ; Carry set
+_:
+        ld (de), a ; Load with file table entry index
+                   ; (FD_CLOEXEC is already set in a if applicable)
+    pop af ; Return file descriptor index
+    ;or a
+    ret
+; }}}
+
+
+;; Allocates a file descriptor for the current process at the specified index.
+; If there is an open file descriptor at the index, it will be closed.
+; Parameters:
+;   a - The index to use.
+;   hl - The inode/device.
+;   bc - The flags.
+; Return:
+;   c flag - Set if there are no more file descriptors available, reset
+;   otherwise.
+;   a - The index of the file descriptor (i.e. preserved).
+; Preserves:
+;   a (see return), bc, ix, iy
+;
+fildes_open_at: ; {{{
+    push af
+        push hl
+            call fildes_deref ; Preserves everything
+            ex (sp), hl
+            jr c, _fdaat_fail
+            ; hl = inode/device
+            ; (sp) = file descriptor
+
+            call filtab_open
+            jr c, _fdaat_fail
+
+        pop hl
+        ld (hl), a ; Set the inddex
+                   ; (FD_CLOEXEC is already set in a if applicable)
+    pop af ; Preserve a
+    or a
+    ret
+
+_fdaat_fail:
+        pop hl
+    pop af
+    scf ; TODO Can this be removed?
+    ret
+
+; }}}
+
+
+;; Increment the reference count of a file description
+; Parameters:
+;   a - File description index (can have the FD_CLOEXEC bit set).
+; Return:
+;   c flag - Reset on success, set on failure.
+; Preserves:
+;   bc, de, ix, iy
+;
+filtab_inc_refs: ; {{{
+    call filtab_deref
+    ret c
+
+    ; filtab_ent_refs = 6
+    inc hl \ inc hl \ inc hl \ inc hl \ inc hl \ inc hl
+    ld a, (hl)
+    inc a
+    scf
+    ret z ; Overflow
+
+    ld (hl), a
+    ccf
+    ret
+; }}}
+
+
+;; Decrement the reference count of a file description
+; If the count reaches 0, the file description is closed.
+; Parameters:
+;   a - File description index (can have the FD_CLOEXEC bit set).
+; Return:
+;   c flag - Reset on success, set on failure.
+; Preserves:
+;   bc, de, ix, iy
+;
+filtab_dec_refs: ; {{{
+    call filtab_deref
+    ret c
+
+    ; filtab_ent_refs = 6
+    inc hl \ inc hl \ inc hl \ inc hl \ inc hl \ inc hl
+    ld a, (hl)
+    dec a
+    jr nz, _
+    ; Free it if there are no more references.
+    dec hl \ dec hl \ dec hl \ dec hl \ dec hl
+    xor a
+    ld (hl), a
+    dec hl
+    ; A little hack since both branches set (hl) to a
+_:
+    ld (hl), a
+    or a
+    ret
+; }}}
+
+
+;; Duplicates a file descriptor.
+; The FD_CLOEXEC of the new file descriptor is cleared.
+; Parameters:
+;   a - The file descriptor to copy.
+; Return:
+;   c flag - Set if the original file descriptor is invalid or there are no more
+;   file descriptors available.
+;   a - The new file descriptor.
+; Preserves:
+;   ix, iy
+; 
+; TODO Make this (and other dup functions) just increment the reference count
+; instead of allocating a new file table entry.
+;
+dup: ; {{{
+    ld c, 0
+    ;jp dup_after
+; }}}
+
+
+;; Duplicates a file descriptor to a new one at or after a specified index.
+; This exists primarily for the FD_DUP command of fcntl().
+; The FD_CLOEXEC of the new file descriptor is cleared.
+; Parameters:
+;   a - The file descriptor to copy.
+;   c - The least index for the new file descriptor.
+; Return:
+;   Same as dup
+; Preserves:
+;   ix, iy
+;   
+dup_after: ; {{{
+    or a
+    ld l, a
+    ld a, i
+    push af
+        di
+        ld a, l
+
+        call fildes_deref
+        jr c, _dup_after_ebadf
+
+        ld a, c
+        push bc
+        push hl
+            call fildes_find_after
+        pop de
+        pop bc
+        jr c, _dup_after_emfile
+
+        ex de, hl
+        ld c, a
+        ; (de) = new fd
+        ; c = new fd index
+        ; (hl) = original fd
+
+        ld a, (hl)
+        ; Mask out FD_CLOEXEC, as the bit does not carry over to the new fd
+        and ~FD_CLOEXEC & $FF
+        ld b, a ; Save the index
+
+        call filtab_inc_refs
+        ; Errors if the descriptor is invalid or the reference count overflows.
+        ; TODO What error would the latter case be? POSIX only talks about EBADF
+        ; and EMFILE, but this isn't quite either.
+        jr c, _dup2_ebadf
+        ; (de) = new fd
+        ; (hl) = file table entry
+        ; b = file table index
+        ; c = new fd index
+
+        ; Copy file table index
+        ld a, b
+        ld (de), a
+    pop af
+    ld a, c
+    ret po
+    ei
+    ret
+
+_dup_after_emfile:
+        ld hl, EMFILE
+        jr _
+_dup_after_ebadf:
+        ld hl, EBADF
+        ;jr _
+_:
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Duplicates a file descriptor into a specified file descriptor.
+; If the file descriptors are equal, no action is taken. If they are not equal,
+; then:
+;   If the specified new file descriptor is open, it will first be closed.
+;   The FD_CLOEXEC of the new file descriptor will be cleared.
+; Parameters:
+;   a - The file descriptor to duplicate.
+;   c - The new file descriptor to duplicate into.
+; Return:
+;   c flag - Set if the original file descriptor not open or the new one is
+;   invalid.
+;   a - New file descriptor (original c).
+; Preserves:
+;   ix, iy
+;
+dup2: ; {{{
+    or a
+    ld l, a
+    ld a, i
+    push af
+        di
+        ld a, l
+
+        ; If they are equal, there is nothing to do
+        cp c
+        jr z, _dup2_done
+
+        call fildes_deref
+        jr c, _dup2_ebadf
+        ex de, hl
+        ; (de) = original fd
+
+        ld a, c
+        call fildes_deref
+        jr c, _dup2_ebadf
+        ex de, hl
+        ; (hl) = original fd
+        ; (de) = new fd
+
+        ; Close the new file descriptor if it is open (the new and original fds
+        ; are not the same since they are compared above)
+        jr nz, _
+        ld b, c ; Save the index (close preserves b)
+        ld a, c
+        push hl
+            call close ; Preserves de
+        pop hl
+        ld c, b
+_:
+
+        ; TODO From here on, this is identical to dup_after. Combine them
+
+        ld a, (hl)
+        ; Mask out FD_CLOEXEC, as the bit does not carry over to the new fd
+        and ~FD_CLOEXEC & $FF
+        ld b, a ; Save the index
+
+        call filtab_inc_refs
+        ; Errors if the descriptor is invalid or the reference count overflows.
+        ; TODO What error would the latter case be? POSIX only talks about EBADF
+        ; and EMFILE, but this isn't quite either.
+        jr c, _dup2_ebadf
+        ; (de) = new fd
+        ; (hl) = file table entry
+        ; b = file table index
+        ; c = new fd index
+
+        ; Copy file table index
+        ld a, b
+        ld (de), a
+
+        ; Return value in c
+_dup2_done:
+    pop af
+    ld a, c
+    ret po
+    ei
+    ret
+
+_dup2_ebadf:
+        ld hl, EBADF
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Closes a file descriptor.
+; This does nothing if the file descriptor was not open at the time of this
+; calling.
+; Parameters:
+;   a - The index to close.
+; Return:
+;   c flag - Set if the idnex is invalid, reset if it is valid.
+; Preserves:
+;   b, de, ix, iy
+;
+close: ; {{{
+    or a
+    ld c, a
+    ld a, i
+    push af
+        di
+        ld a, c
+
+        call fildes_deref
+        jr c, _close_ebadf
+        jr z, _close_ebadf
+
+        ld a, (hl)
+        ld c, $FF
+        ld (hl), c
+
+        ; Decrement the file table entry reference count
+        call filtab_dec_refs
+        jr c, _close_ebadf
+
+_close_done:
+    pop af
+    ret po
+    ei
+    ret
+
+_close_ebadf:
+        ld hl, EBADF
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+

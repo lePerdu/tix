@@ -1,0 +1,2369 @@
+;
+; filesystem.z80
+;
+; Procedures for handling the filesystem. Other system calls should not modify
+; flash directly and can usually avoid changing memory mappings.
+;
+; The filesystem is based off LogFS, though takes some features from JFFS.
+;
+; Since files usually need to be moved to be modified, a single special file
+; keeps track of all inodes and offsets in the filesystem. Directory entries
+; only store inode numbers and filenames, so that the actual inodes (which are
+; not separated from their data as they are in block-device filesystems) can be
+; moved without modifying their directories; only the inode file has to be
+; updated. The root inode always has a inode number of 1 and is first in the
+; inode file; the inode file has an inode number of 0, though there is no entry
+; in the file: the number is treated specially. Each directory contains an entry
+; for its parent directory (".."), which cannot be removed, though no "." entry,
+; as it is easy to resolve such a path component.
+;
+; When a file is modified and moved, the inode table is updated. When a file
+; (link to an inode) is (re)moved, the parent directory is updated by writing
+; over the inode number with 0s; blank entries are removed upon tmp
+; collection. When the last link to an inode is removed, its entry in the inode
+; file is deleted by writing 0s over it (the gap is removed only when the file
+; must be moved); the inode is then flagged for deletion. If the tail of the
+; used space crosses into a new erase block, the block is erased. This is done
+; incrementally instead of all at once during tmp collection and formatting.
+;
+; The first erase block is the "anchor block" and is used to keep track of the
+; inode file and the current head of the filesystem. Since the inode file has to
+; be updated after every change to any other file, it will always be the last
+; file, and so the tail of the filesystem does not have to be stored. The head
+; is written at the first address in the block; the inode file location is
+; written at the end of the block. When either value changes, it is overwritten
+; with 0 and placed in the next open spot. When they reach each other, the
+; block will be erased and the values will be written at their initial
+; locations.
+;
+; When the filesystem fills up, the tmp collector is run. For each block
+; (except the first one, which is tmp collected as described above), valid
+; inodes and their associated data are copied into new blocks starting at the
+; end and wrapping around to the beginning, adjusting the head and tail offsets
+; along the way. Additionally, blank directory entries are removed.
+;
+; Offsets are stored as 3 bytes: the first storing the page and the remaining
+; storing the offset into the page.
+;
+; TODO Disable interrupts for more (i.e. pretty much all) functions.
+; TODO Set errno for more (i.e. pretty much all) functions and conditions.
+;
+
+.nolist
+#include "flash.inc"
+#include "fcntl.inc"
+#include "memmap.inc"
+#include "ports.inc"
+#include "stat.inc"
+.list
+
+
+;; Reads the anchor block and stores the values in RAM so that the filesystem
+;; can be used.
+; Return:
+;   c flag - Reset if the filesystem could be read, set if not (because it is
+;       invalid).
+;
+fs_read_init: ; {{{
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        ; Get filesystem head
+        ld a, FS_PAGE_START
+        out (PORT_MEM_BANK_A), a
+        ld hl, MEM_BANK_A_ADDR
+
+_fsri_search_head:
+        ld a, (hl)
+        or a
+        jr nz, _fsri_found_head
+
+        inc hl \ inc hl \ inc hl
+
+        ; See if at the end of the page
+        ; (since $4000 is not divisible by 3, increment once more and check if
+        ; it equals $8000, or if bit 15 is set)
+        inc hl
+        bit 7, h
+        dec hl ; Does not effect flags
+        jr z, _
+        ; Go to next page
+        in a, (PORT_MEM_BANK_A)
+        ; If we haven't found any valid data, the filesystem is invalid
+        cp FS_PAGE_START + 3
+        jr z, _fsri_fail
+        inc a
+        out (PORT_MEM_BANK_A), a
+        ld hl, MEM_BANK_A_ADDR
+_:
+
+        jr _fsri_search_head
+
+_fsri_found_head:
+        in a, (PORT_MEM_BANK_A)
+        ld (fs_head_anchor), a
+        ld (fs_head_anchor+1), hl
+
+        ld a, (hl)
+        ld (fs_head), a
+        inc hl
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        ld (fs_head+1), hl
+
+        ; Get inode file location (search from the end)
+        ld a, FS_PAGE_START + 3
+        out (PORT_MEM_BANK_A), a
+        ld hl, MEM_BANK_B_ADDR - 4
+
+_fsri_search_inode:
+        ld a, (hl)
+        or a
+        jr nz, _fsri_found_inode
+
+        dec hl \ dec hl \ dec hl
+
+        ; See if past the start of the page
+        ; (check if bit 14 is reset)
+        bit 6, h
+        jr nz, _
+        ; Go to next (previous) page
+        in a, (PORT_MEM_BANK_A)
+        cp FS_PAGE_START
+        ; If we haven't found any valid data, the filesystem is invalid
+        jr z, _fsri_fail
+        dec a
+        out (PORT_MEM_BANK_A), a
+        ld hl, MEM_BANK_B_ADDR - 4
+_:
+
+        jr _fsri_search_inode
+
+
+_fsri_found_inode:
+        in a, (PORT_MEM_BANK_A)
+        ld (fs_inode_anchor), a
+        ld (fs_inode_anchor+1), hl
+
+        ld a, (hl)
+        ld (fs_inode_file), a
+        inc hl
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        ld (fs_inode_file+1), hl
+
+        ; Compute tail by adding inode file's size
+        ld a, (fs_inode_file)
+        out (PORT_MEM_BANK_A), a
+        ld iy, (fs_inode_file+1)
+        ld c, (iy + inode_size)
+        ld b, (iy + inode_size+1)
+
+        ;ld hl, (fs_inode_file+1)
+        add hl, bc
+        ld bc, sizeof_inode
+        add hl, bc
+
+        ; See if on the next page (bit 15 is set)
+        bit 7, h
+        jr z, _
+        ; Reset bit 7 to put back on bank A
+        res 7, h
+        ; a still = inode file page
+        inc a
+_:
+        ld (fs_tail), a
+        ld (fs_tail+1), hl
+
+    pop af
+    ret po
+    ei
+    ret
+
+_fsri_fail:
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Formats the filesystem to start over.
+; This erases the first block and sets initial pointers for the inode file,
+; head, and tail. The inode file and the root inode are placed in the second
+; block, which is also erased.
+; 
+; Preserves:
+;   ix, iy
+;
+fs_format: ; {{{
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        ld a, FS_PAGE_START
+        call flash_erase
+
+        ld a, FS_PAGE_START
+        out (PORT_MEM_BANK_A), a
+
+        ; Writes are made to a buffer then copied over all at once
+
+        ; Inode file offset and size
+        ld hl, fs_inode_file
+        ld a, FS_PAGE_START + 4
+        ld (hl), a
+        ld de, MEM_BANK_A_ADDR + sizeof_inode + sizeof_fs_direntry
+        inc hl
+        ld (hl), e
+        inc hl
+        ld (hl), d
+
+        ld hl, fs_inode_file
+        ld de, MEM_BANK_A_ADDR
+        ld bc, 3
+        call flash_write_buf
+
+        ; Log head
+        ld hl, fs_head
+        ld a, FS_PAGE_START + 4
+        ld (hl), a
+        ld de, MEM_BANK_A_ADDR
+        inc hl
+        ld (hl), e
+        inc hl
+        ld (hl), d
+
+        ld hl, fs_head
+        ld de, MEM_BANK_A_ADDR + (FLASH_PAGE_SIZE / 2)
+        ld bc, 3
+        call flash_write_buf
+
+        ; Log tail
+        ld hl, fs_tail
+        ld a, FS_PAGE_START + 4
+        ld (hl), a
+        ld de, MEM_BANK_A_ADDR + sizeof_inode + sizeof_fs_direntry + sizeof_inode + sizeof_inode_entry
+        inc hl
+        ld (hl), e
+        inc hl
+        ld (hl), d
+
+        ld hl, fs_tail
+        ld de, MEM_BANK_A_ADDR + FLASH_PAGE_SIZE - 3
+        ld bc, 3
+        call flash_write_buf
+
+        ; Write the initial inode file and root directory
+        ld a, FS_PAGE_START + 4
+        call flash_erase
+
+        ld a, FS_PAGE_START + 4
+        out (PORT_MEM_BANK_A), a
+
+        ld hl, kernel_tmp
+        ; Root inode. permissions = 755
+        ld de, S_IFDIR | S_IRWXU | S_IXGRP | S_IRGRP | S_IXOTH | S_IROTH
+        ld (hl), e
+        inc hl
+        ld (hl), d
+        ; Size is sizeof_fs_direntry
+        ld bc,  sizeof_fs_direntry
+        inc hl
+        ld (hl), c
+        inc hl
+        ld (hl), b
+        ; uid and gid are 0
+        xor a
+        inc hl
+        ld (hl), a
+        inc hl
+        ld (hl), a
+        ; nlinks = 2 (one for "/" and one for "..")
+        ld a, 2
+        inc hl
+        ld (hl), a
+        ; ".." entry points to the root directory
+        ld de, 1
+        inc hl
+        ld (hl), e
+        inc hl
+        ld (hl), d
+        ld a, '.'
+        inc hl
+        ld (hl), a
+        inc hl
+        ld (hl), a
+        ; Fill the rest with 0s
+        xor a
+        ld b, NAME_MAX - 2
+_:
+        inc hl
+        ld (hl), a
+        djnz -_
+
+        ; The inode file only uses the first 2 bytes of its inode. The rest is
+        ; just padding to make it look the same as all other files.
+        ld de, S_INDFIL
+        inc hl
+        ld (hl), e
+        inc hl
+        ld (hl), d
+        ; The size is 1 entry: the root inode.
+        ld bc, sizeof_inode_entry
+        inc hl
+        ld (hl), c
+        inc hl
+        ld (hl), b
+        ; Move past uid, gid, and nlinks
+        inc hl
+        inc hl
+        inc hl
+        ; Root inode entry
+        ld de, 1
+        inc hl
+        ld (hl), e
+        inc hl
+        ld (hl), d
+        ld a, FS_PAGE_START + 4
+        inc hl
+        ld (hl), a
+        ; Offset
+        ld de, MEM_BANK_A_ADDR
+        inc hl
+        ld (hl), e
+        inc hl
+        ld (hl), d
+
+        ld hl, kernel_tmp
+        ld de, MEM_BANK_A_ADDR
+        ld bc, sizeof_inode + sizeof_fs_direntry + sizeof_inode + sizeof_inode_entry
+        call flash_write_buf
+
+    pop af
+    out (PORT_MEM_BANK_A), a
+    jp po, _
+    ei
+_:
+    ret
+; }}}
+
+
+;; Finds the address of an inode from its identifier.
+; Parameters:
+;   hl - The inode number.
+; Return:
+;   c flag - Reset if the inode was found; set if it was not.
+;   a - The page of the inode.
+;   hl - Address of the inode.
+;   de - Address in the inode file of the entry (if the file is not the inode
+;   file). The page is mapped to memory bank A.
+; Preserves:
+;   ix, iy
+; Notes:
+;   The page of the inode will not necessarily be mapped to any memory bank. The
+;   inode number 0 signifies the inode file.
+;
+fs_search_inode_: ; {{{
+    ; If the inode is 0, it is the inode file
+    ld a, h
+    or l
+    jr nz, _
+    ld a, (fs_inode_file)
+    ld hl, (fs_inode_file+1)
+    ; c flag reset from the or instrution
+    ret
+_:
+    ld a, (fs_inode_file)
+    out (PORT_MEM_BANK_A), a
+
+    ex de, hl
+
+    ; Get size at offset inode_size = 2
+    ld hl, (fs_inode_file+1)
+    inc hl \ inc hl
+    ld c, (hl)
+    inc hl
+    ld b, (hl)
+    ld a, sizeof_inode - 3
+    add a, l
+    ld l, a
+    ld a, 0
+    adc a, h
+    ld h, a
+
+_fssi_loop:
+    ld a, (hl)
+    inc hl
+    cp e
+    jr nz, _
+    ld a, (hl)
+    cp d
+    jr z, _fssi_found
+
+_:
+    inc hl
+    inc hl
+    inc hl
+    inc hl
+    dec bc
+    dec bc
+    dec bc
+    dec bc
+    dec bc
+    ld a, c
+    or c
+    jr nz, _fssi_loop
+
+_fssi_not_found:
+    scf
+    ret
+
+_fssi_found:
+    ld d, h \ ld e, l
+    dec de
+    inc hl
+    ld c, (hl)
+    inc hl
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    ld a, c
+    or a
+    ret
+; }}}
+
+    
+;; Searches a directory for an entry with a given name.
+; The current process must have search privileges on the directory for this to
+; succede.
+; Note: This returns with the entry's page mapped to bank A, so calling code
+; should restore it. TODO (maybe) restore the page here to be safe.
+;
+; Parameters:
+;   hl - The directory inode.
+;   (de) - The entry name.
+;   c - Length of name.
+; Return:
+;   c flag - Reset if a matching entry was found, set if one was not, the inode
+;       is not of a direcctory, or the current process does not have sufficient
+;       permissions.
+;   hl - The inode of the matching entry.
+;   (de) - Matching entry (on bank A).
+; Preserves:
+;   c, ix
+;
+fs_search_dir: ; {{{
+    push bc
+    push de
+        call fs_search_inode_
+        jr nc, _
+    pop de
+    pop bc
+    jr _fssd_not_found
+_:
+        out (PORT_MEM_BANK_A), a
+    pop de
+    pop bc
+    push hl \ pop iy ; Index registers are nice for structures
+
+    ; Check if a directory (type is in MSB)
+    ld b, (iy + inode_mode+1) ; Needed below
+    ld a, b
+    and S_IFMT >> 8
+    cp S_IFDIR >> 8
+    jr z, _
+    scf
+    ret
+_:
+
+    ; Need search (not read) permission
+    push bc
+    push de
+        ld a, O_SEARCH
+        ld c, (iy + inode_mode)
+        ;ld b, (iy + inode_mode+1)
+        ld e, (iy + inode_uid)
+        ld d, (iy + inode_gid)
+        call perm_check_file_mode
+    pop de
+    pop bc
+    scf
+    ret nz
+
+    ; Get size and divide by sizeof_fs_direntry = 16
+    ld l, (iy + inode_size)
+    ld h, (iy + inode_size+1)
+    srl h \ rr l
+    srl h \ rr l
+    srl h \ rr l
+    srl h \ rr l
+
+    ; Start at name
+    ld a, sizeof_inode + fs_direntry_name
+    add a, iyl
+    ld iyl, a
+    jr nc, _
+    inc iyh
+_:
+
+    ld b, 0 ; MSB of the length
+
+    ; (iy) - Directory enrty
+    ; (de) - String
+    ; bc - Lenth of string
+    ; hl - Number of directory entries
+_fssd_loop:
+    ; Check/decrement the counter (hl) here in case there are no entries
+    ld a, h
+    or l
+    jr z, _fssd_not_found
+    dec hl
+
+    push iy
+        ex (sp), hl
+        push de
+        push bc
+            ld bc, NAME_MAX
+            call strnlen
+            ld a, c
+        pop bc
+        pop de
+        push de
+        push bc
+            ; Lengths have to be the same
+            cp c
+            jr nz, _
+            call strncmp
+_:
+        pop bc
+        pop de
+    pop hl
+    jr z, _fssd_found
+
+    ; TODO See if this is faster than adding using the accumulator (it is with
+    ; hl, but I'm not sure about with iy)
+    push de
+        ld de, sizeof_fs_direntry
+        add iy, de
+    pop de
+
+    jr _fssd_loop
+
+_fssd_found:
+    ; (iy) = name of the matching entry
+    ld h, (iy - 1)
+    ld l, (iy - 2)
+    push iy \ pop de
+    dec de \ dec de
+    or a
+    ret
+
+_fssd_not_found:
+    scf
+    ret
+; }}}
+
+
+;; Searches a directory for an entry with a given inode.
+; The current process must have search and read (TODO is read necessary?)
+; privileges on the directory for this to succede.
+; This returns a string pointing into the filesystem, which could potentially
+; be overwritten by other filesystem calls. Interrupts should therefore be
+; disabled until after the string returned is used.
+; Parameters:
+;   hl - The directory inode.
+;   de - Inode to search for.
+; Return:
+;   c flag - Reset if a matching entry was found, set if not.
+;   (hl) - Name of the matching entry (on page A).
+; Preserves:
+;   ix
+;
+fs_search_dir_inode: ; {{{
+    push de
+        call fs_search_inode_
+        jr nc, _
+    pop de
+    jr _fssdi_fail
+_:
+    pop de
+    out (PORT_MEM_BANK_A), a
+    push hl \ pop iy ; Index registers are nice for structures
+
+    ; Check if a directory (type is in MSB)
+    ld b, (iy + inode_mode+1) ; Needed below
+    ld a, b
+    and S_IFMT >> 8
+    cp S_IFDIR >> 8
+    jr nz, _fssdi_fail
+
+    push de
+        ; Need search and read permission
+        ld a, O_SEARCH | O_RDONLY
+        ld c, (iy + inode_mode)
+        ;ld b, (iy + inode_mode+1)
+        ld e, (iy + inode_uid)
+        ld d, (iy + inode_gid)
+        call perm_check_file_mode
+    pop de
+    jr nz, _fssdi_fail
+
+    ; Get size and divide by sizeof_fs_direntry = 16
+    ld c, (iy + inode_size)
+    ld b, (iy + inode_size+1)
+    srl b \ rr c
+    srl b \ rr c
+    srl b \ rr c
+    srl b \ rr c
+
+    ; Move to start of data
+    push iy \ pop hl
+    ld a, sizeof_inode + fs_direntry_inode
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+
+    ; (hl) - Directory enrty
+    ; de - Inode
+    ; bc - Number of entries
+_fssdi_loop:
+    ; Check/decrement the counter, bc, here in case there are no entries
+    ld a, b
+    or c
+    jr z, _fssdi_fail
+    dec bc
+
+    ld a, (hl)
+    cp e
+    jr nz, _
+    inc hl
+    ld a, (hl)
+    inc hl ; Move to end
+    cp d
+    jr z, _fssdi_found
+    ; hl is already incremented, so a can be less
+    ld a, sizeof_fs_direntry - 2
+    jr ++_
+_:
+    ld a, sizeof_fs_direntry
+_:
+
+    ; Faster than push, add, pop with de
+    add a, l
+    ld l, a
+    jr nc, _fssdi_loop ; no inc h
+    inc h
+    jr _fssdi_loop
+
+_fssdi_found:
+    ; (hl) = name of the matching entry
+    or a
+    ret
+
+_fssdi_fail:
+    scf
+    ret
+; }}}
+
+
+;; Searches a directory for an entry at an index.
+; TODO Currently, if an entry is removed, successive calls to this will not
+; return all entries. This problem exists in OSX, so I suppose it isn't a huge
+; deal, but it does not seem POSIX compliant. I'm not sure how to fix this, but
+; some options include:
+;   passing an inode with the index so that the state can be verified to be
+;       correct
+;   zero-ing out entries so that order does not change.
+;   sorting entries and taking a name whose position can be found.
+;   sorting entries by inode and finding position that way, though this fails if
+;       an inode is reused.
+;   Reading all inodes in the directory on opendir()/rewinddir() and have
+;       readdir() use fs_search_dir_inode(), though this takes up more memory than
+;       should be necessary.
+;
+; Parameters:
+;   hl - Inode of the directory.
+;   bc - Index of the entry.
+;   (de) - direntry structure to store the information.
+; Return:
+;   c flag - Reset on success, set on failure.
+; Preserves:
+;   ix
+;
+fs_next_direntry: ; {{{
+    in a, (PORT_MEM_BANK_A)
+    push af
+        push de
+            push bc
+                call fs_search_inode_
+                jr c, _fsnde_fail_2p
+                out (PORT_MEM_BANK_A), a
+                push hl \ pop iy ; Index registers are nice for structures
+
+                ; Check if a directory (type is in MSB)
+                ; This is only called from readdir(), but the check is still made in
+                ; case the inode was reused.
+                ld b, (iy + inode_mode+1) ; Needed below
+                ld a, b
+                and S_IFMT >> 8
+                cp S_IFDIR >> 8
+                jr c, _fsnde_fail_2p
+
+                ; Need search and read permission
+                ; This does have to be checked every time because it could be changed.
+                ld a, O_SEARCH | O_RDONLY
+                ld c, (iy + inode_mode)
+                ;ld b, (iy + inode_mode+1)
+                ld e, (iy + inode_uid)
+                ld d, (iy + inode_gid)
+                call perm_check_file_mode
+                jr c, _fsnde_fail_2p
+
+                ; Size
+                ld c, (iy + inode_size)
+                ld b, (iy + inode_size+1)
+            pop hl ; Index
+
+            ; Convert index to offset
+            ; sizeof_fs_direntry = 16
+            add hl, hl
+            add hl, hl
+            add hl, hl
+            add hl, hl
+
+            or a
+            sbc hl, bc
+            jr nc, _fsnde_fail_1p
+
+            ; Get the offset back
+            add hl, bc
+            ld b, h \ ld c, l
+
+            ; Move to start of data
+            push iy \ pop hl
+            add hl, bc
+            ld bc, sizeof_inode
+            add hl, bc
+        pop de
+        ld bc, sizeof_fs_direntry
+        ldir
+        ; Write 1 more null byte in case the name was full.
+        xor a
+        ld (de), a
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret
+
+_fsnde_fail_2p:
+            pop bc
+_fsnde_fail_1p:
+        pop de
+_fsnde_fail:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret
+; }}}
+
+
+;; Gets the size of a file.
+; Parameters:
+;   hl - The inode.
+; Return:
+;   c flag - Set if the inode does not exist, reset if it does and could be
+;   read.
+;   bc - The mode of the file.
+; Preserves:
+;   hl, ix, iy
+;
+fs_get_mode: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        push hl
+            call fs_search_inode_
+        pop de
+        ; Doing this 3 times is kind of odd but I think the most efficient
+        ex de, hl
+        jr nc, _
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+_:
+        out (PORT_MEM_BANK_A), a
+        ex de, hl
+        ; inode_mode = 0
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+        ex de, hl
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Gets the size of a file.
+; Parameters:
+;   hl - The inode.
+; Return:
+;   c flag - Set if the inode does not exist, reset if it does and could be
+;   read.
+;   bc - The size of the file.
+; Preserves:
+;   hl, ix, iy
+;
+fs_get_size: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        push hl
+            call fs_search_inode_
+        pop hl
+        ex de, hl
+        jr nc, _
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+_:
+        out (PORT_MEM_BANK_A), a
+        ex de, hl
+        ; inode_size = 2
+        inc hl
+        inc hl
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+        ex de, hl
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Gets the UID and GID of a file.
+; Parameters:
+;   hl - Inode of the file.
+; Return:
+;   c flag - Set if the inode does not exist, reset if it does and could be
+;   read.
+;   c - UID of the file.
+;   b - GID of the file.
+; Preserves:
+;   hl, ix, iy
+;
+fs_get_uid_gid: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        push hl
+            call fs_search_inode_
+        pop de
+        ; Doing this 3 times is kind of odd but I think the most efficient
+        ex de, hl
+        jr nc, _
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+_:
+        out (PORT_MEM_BANK_A), a
+        ex de, hl
+        ; inode_uid = 4
+        inc hl \ inc hl \ inc hl \ inc hl
+        ld c, (hl)
+        ; inode_gid = 5
+        inc hl
+        ld b, (hl)
+        ex de, hl
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Adjusts the log tail so that data of a specified size can be written, garbage
+;; collecting if necessary.
+; The size must not excede a single page ($4000 = 16 KiB).
+; Parameters:
+;   bc - The amount of space desired.
+; Return:
+;   c flag - Reset if there is enough space, set if there is not.
+;   (fs_tail) - Set so that there is enough space.
+;   hl - The address offset in fs_tail.
+; Preserves:
+;   bc, de, ix, iy
+;
+fs_find_space_: ; {{{
+    call _fsfs_no_gc
+    ret nc
+    push bc
+    push de
+        call fs_garbage_collect_
+    pop de
+    pop bc
+    ;call _fsfs_no_gc
+    ;ret
+
+; Internal subroutine so that space can checked before and after garbage
+; collection.
+_fsfs_no_gc:
+    ld hl, fs_tail+1
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+
+    push hl ; Return with the address
+        ld a, (-MEM_BANK_A_ADDR) & $FF
+        add a, l
+        ld l, a
+        ld a, (-MEM_BANK_A_ADDR) >> 8
+        adc a, h
+        ld h, a
+        add hl, bc
+        bit 6, h ; Check for page overflow
+    pop hl
+    jr z, _fsfs_ng_return
+    ld a, (fs_tail)
+    inc a
+    ; TODO When garbage collection is implemented, this needs to stop at
+    ; fs_head-4 to leave an erase block open.
+    cp FS_PAGE_END+1
+    jr z, _fsfs_ng_fail
+    ; Only update fs_tail on success.
+    ld (fs_tail), a
+    ld hl, MEM_BANK_A_ADDR
+    ld (fs_tail+1), hl
+_fsfs_ng_return:
+    or a
+    ret
+_fsfs_ng_fail:
+    scf
+    ret
+; }}}
+
+
+;; Sets the size of a file, extending it or deleting data as necessary.
+; If the file is extended, the newly allocated data is filled (left) with 1s.
+; TODO Such behavior is contrary to POSIX (and usability), but filling with 0s
+; is counter-productive when writing to flash. The best course would probably be
+; to have an extra size specifying the defined data so that it could appear that
+; the unset data is 0. (This behaviour is hinted at by POSIX)
+;
+; Parameters:
+;   hl - Inode number.
+;   bc - New size.
+; Return:
+;   c flag - Set on error, reset on success.
+; Preserves:
+;   ix
+;
+fs_truncate_file: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        ; This is mostly just a wrapper for fs_write_inode_
+        ; Save the inode number for later. fs_write_inode_ uses iy anyway, so this
+        ; does not stop anything from being preserved
+        push hl \ pop iy
+        push bc
+            call fs_search_inode_
+        pop bc
+        jr nc, _
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+_:
+
+        out (PORT_MEM_BANK_A), a
+
+        ld de, kernel_tmp
+        ld bc, sizeof_inode
+        ldir
+
+        push iy \ pop hl
+        ld iy, kernel_tmp
+        ld (iy + inode_size), c
+        ld (iy + inode_size+1), b
+
+        ; TODO Don't search for the inode again
+        call fs_write_inode_
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Internal helper function used by fs_write_file, fs_append_file, and
+;; fs_write_inode_ to mark the old file for deletion and update the inode file
+;; or anchor block as necessary.
+; Parameters:
+;   TODO Make these more logical since 3 functions call this now
+;   (hl) - The start of the old file.
+;   a - The page of the old file.
+;   (de) - The end of the new file (page in bank A).
+;   (fs_tail) - Stores the location of the start of the new file (i.e. has not
+;   yet been updated).
+;   (bc) - Inode entry location in the inode file.
+;
+fs_update_file_loc_: ; {{{
+    push bc
+    push de
+        ; Update the fs_tail page and swap the current page with the one for the
+        ; old file.
+        ld c, a
+        in a, (PORT_MEM_BANK_A)
+        ld (fs_tail), a
+        ld a, c
+        out (PORT_MEM_BANK_A), a
+
+        ; Invalidate the old file (the | ~S_IFMT is to avoid overwriting other
+        ; mode bits)
+        ; Some bug in SPASM makes it complain about the value being too large
+        ; (probably something to do with the compliment and it using regular int
+        ; types instead of 16-bit values when calculating expressions), so the
+        ; value is masked after being shifted
+        ld a, (S_IDEL | ~S_IFMT) >> 8 & $FF
+        ; inode_mode = 0
+        inc hl ; Write to MSB
+        and (hl)
+        call flash_write_byte
+    pop hl
+    pop bc
+
+    ; fs_tail has not been updated, so it points to the start of the new file.
+    ld de, (fs_tail+1)
+    ld (fs_tail+1), hl
+    ex de, hl
+
+    inc hl
+    ld a, (hl)
+    dec hl
+    and S_IFMT >> 8
+    cp S_INDFIL >> 8
+    jr z, _fswfum_update_anchor
+
+_fswfum_update_inode_file:
+    ; Update the inode file
+
+    ld a, (fs_tail)
+    out (PORT_MEM_BANK_A), a
+
+    ex de, hl
+    ; fs_write_file uses the first part. TODO This may overwrite data from the
+    ; original write/append call which triggered this call, so that should
+    ; probably be changed (have the functions reserve more of kernel_tmp) or
+    ; warned.
+    ld hl, kernel_tmp + sizeof_inode
+    ld (hl), a
+    inc hl
+    ld (hl), e
+    inc hl
+    ld (hl), d
+
+    ; Convert the address of the entry to an offset in the inode file (and move
+    ; to the location part)
+    ld h, b \ ld l, c
+    ld de, (fs_inode_file+1)
+    or a
+    sbc hl, de
+    ld de, -sizeof_inode + inode_entry_page
+    add hl, de
+    ex de, hl
+
+    ld iy, kernel_tmp + sizeof_inode
+    ld bc, 3 ; Just the location
+    ld hl, 0 ; The inode file
+    jp fs_write_file
+
+_fswfum_update_anchor:
+    ; Update the position of the inode file in the anchor block
+
+    ld a, (fs_tail) ; This relies on files being single-page.
+    ld (fs_inode_file), a
+    ld (fs_inode_file+1), hl
+
+    ; Push the data to write on the stack so that it can be written as a buffer
+    ; (flash_write_byte copies code to RAM every time).
+    ;   new page, adddr
+    ;   $00, $0000
+    push hl
+    ;ld a, (fs_inode_file)
+    push af
+    inc sp ; Skip over f
+
+    ; (hl) = Data to write
+    ld hl, 0
+    add hl, sp
+
+    ld de, (fs_inode_anchor+1)
+    dec de \ dec de \ dec de
+    ; See if past the start of the page
+    ld a, d
+    cp $3F
+    jr nz, _
+    ld a, e
+    cp $FD
+    jr z, _fswfum_ua_next_page
+_:
+
+    ; See if at the start of page 4 (and garbage collect if so)
+    ;ld a, e
+    cp $00
+    jr nz, _
+    ld a, d
+    cp $40
+    jr nz, _
+
+    ; Clean up the stack
+    pop hl
+    inc sp
+    jp fs_garbage_collect_anchor_ ; Sets the new values
+_:
+
+_fswfum_ua_same_page:
+    ; Page stays the same
+    ld a, (fs_inode_anchor)
+    out (PORT_MEM_BANK_A), a
+    ; New address
+    ld (fs_inode_anchor+1), de
+
+    ld bc, 3
+    call flash_write_buf
+    jr _fswfum_ua_done
+
+_fswfum_ua_next_page:
+    ; Go to next (well, previous, actually) page
+    ld a, (fs_inode_anchor)
+    dec a
+    ld (fs_inode_anchor), a
+    out (PORT_MEM_BANK_A), a
+
+    ; Write the new address at the end of the page
+    ; (It's actually 1 from the end since $4000 is not divisible by 3)
+    ld de, MEM_BANK_B_ADDR - 1 - 3
+    ld (fs_inode_anchor+1), de
+
+    ld bc, 3
+    call flash_write_buf
+    ; (hl) = 3 zero bytes (cover up the old data)
+
+    ; Write 0 at the start of the old page
+    in a, (PORT_MEM_BANK_A)
+    inc a
+    out (PORT_MEM_BANK_A), a
+    ld de, MEM_BANK_A_ADDR
+    ld bc, 3
+    call flash_write_buf
+    ;jr _fswfum_ua_done
+
+_fswfum_ua_done:
+    ; Clean up the stack.
+    ; hl is after the data to write = the original stack pointer
+    pop hl
+    inc sp
+
+    or a
+    ret
+; }}}
+
+
+;; Reads data from an offset in a file.
+; Parameters:
+;   hl - Inode number.
+;   de - Offset to read from.
+;   (iy) - Buffer to store the read data. This must be in RAM.
+;   bc - The maxmimum number of bytes to read.
+; Return:
+;   c flag - Set on error, reset on success.
+;   bc - The number of bytes read.
+; Preserves:
+;   ix, iy
+;
+fs_read_file: ; {{{
+    ld a, b
+    or c
+    ret z
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        ; For now, this is pretty simple since files are unfragmented.
+
+        push bc
+        push de
+            call fs_search_inode_
+        pop de
+        pop bc
+        jr c, _fsrf_fail
+
+        push hl
+            ; inode_size = 2
+            inc hl
+            inc hl
+            ld a, (hl)
+            inc hl
+            ld h, (hl)
+            ld l, a
+
+            ; size - offset - len
+            or a
+            sbc hl, de
+            sbc hl, bc
+            ld a, h
+            or a
+            jp p, _
+            ; if < 0, len = size - offset
+            add hl, bc
+            ld b, h \ ld c, l
+_:
+        pop hl
+        ; Nothing to write
+        ld a, b
+        or c
+        jr z, _
+
+        add hl, de
+        ld de, sizeof_inode
+        add hl, de
+        push iy \ pop de
+        push bc
+            ldir
+        pop bc
+
+_:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+
+_fsrf_fail:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Writes data to an offset in a file, overwritinig existing data.
+;
+; The file can be of any type, including the inode file. If the file is not the
+; inode file, the inode file will be updated with the new location of the
+; written file.
+; The data pointer must not be on memory bank A ($4000-$7FFF), as that bank is
+; swapped out to be written to. Additionally, the data should not be in the
+; first sizeof_inode bytes of kernel_tmp, as this buffer is used to copy the
+; original inode temporarily (this is kind of dangerous, but this function and
+; that RAM are only used internally).
+;
+; The above rules also apply to fs_append_file.
+;
+; TODO The code here is kind of messy. Re-writing it as multiple calls to the
+; simpler (cleaner) fs_append_file() and fs_truncate_file() (truncate, append
+; new data, append rest of the file) would probably make it better and reduce
+; the amount of code duplication. Currently, doing so would result in the file
+; and the inode file being written multiple times, but if there is a way to
+; change that, the speed would be about the same as it is now, as the main
+; bottleneck is writing to flash.
+;
+; Parameters:
+;   hl - Inode number.
+;   de - Offest to write to.
+;   (iy) - Data to write.
+;   bc - Length of data.
+; Return:
+;   c flag - Set on error, reset on success.
+;
+fs_write_file: ; {{{
+    ld a, b
+    or c
+    ret z
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        ld ix, 0
+        add ix, sp
+
+#define _rom_page -1
+        dec sp ; 1 byte to store ROM pages
+#define _inode_file_off -3
+        push hl ; 2 bytes to store the offset in the inode file
+
+        push bc
+        push de
+            call fs_search_inode_
+            jp c, _fswf_fail
+
+            out (PORT_MEM_BANK_A), a
+            ld (ix + _rom_page), a
+
+            ld (ix + _inode_file_off), e
+            ld (ix + _inode_file_off+1), d
+
+            ; Copy inode to kernel_tmp to modify it before copying to the
+            ; new file location.
+            ld de, kernel_tmp
+            ld bc, sizeof_inode
+            push hl
+                ldir
+            pop hl
+        pop de
+        pop bc
+
+        push bc
+            push de
+            push hl
+                ; See if the file needs to be expanded
+                ; Find data offset + data length - file size. If it is positive,
+                ; expand the file by it (technically, this also includes 0, but
+                ; there would be no change in that case)
+                ex de, hl
+                add hl, bc
+                ld bc, (kernel_tmp + inode_size)
+                or a
+                sbc hl, bc
+                add hl, bc ; Does not affect flags
+
+                jp m, _
+                ld (kernel_tmp + inode_size), hl
+                jr ++_
+_:
+                ld h, b \ ld l, c ; Set to the original size
+_:
+                ld bc, sizeof_inode
+                add hl, bc
+                ld b, h \ ld c, l
+                call fs_find_space_
+                jr c, _fswf_fail
+
+                ; Write the new inode
+                ld a, (fs_tail)
+                out (PORT_MEM_BANK_A), a
+                ; de points to the end of the new file for the remainder of the
+                ; function to chain together calls to flash_write_buf (which
+                ; acts like ldir)
+                ld de, (fs_tail+1)
+                ld hl, kernel_tmp
+                ld bc, sizeof_inode
+                call flash_write_buf
+            pop hl
+            pop bc ; Offset
+
+            push bc
+            push hl
+                ; Copy until the offset from the old file
+                ld a, sizeof_inode
+                add a, l
+                ld l, a
+                jr nc, _
+                inc h
+_:
+
+                ; de is where is should be after the last flash_write_buf
+                ld a, (ix + _rom_page)
+                call flash_copy
+            pop hl
+            pop bc ; Popped off later
+
+        pop bc ; Data length
+
+        push bc
+            dec sp ; Move back over the data offset pushed from before
+            dec sp
+                push hl
+                    ; Write the new data
+
+                    push iy \ pop hl
+                    call flash_write_buf
+
+                pop iy ; iy is free now
+            pop hl ; Offset
+        pop bc ; Data length
+        add hl, bc
+
+        ; (iy) = Start of old file
+
+        ld c, (iy + inode_size)
+        ld b, (iy + inode_size+1)
+
+        ; Find offset + length - size (again) to see if there is any more data
+        ; to write from the original file.
+        push hl
+            or a
+            sbc hl, bc
+        pop bc
+
+        push iy
+            jr nc, _fswf_no_append
+
+            ; Move to offset + length in the file
+            add iy, bc
+            ld bc, sizeof_inode
+            add iy, bc
+            ; Negate hl into bc
+            ld a, h
+            cpl
+            ld c, a
+            ld a, l
+            cpl
+            ld c, a
+            inc bc
+
+            push iy \ pop hl
+            ld a, (ix + _rom_page)
+            call flash_copy
+
+_fswf_no_append:
+        pop hl
+
+        ld c, (ix + _inode_file_off)
+        ld b, (ix + _inode_file_off+1)
+
+        ld a, (ix + _rom_page)
+
+        ld sp, ix
+        call fs_update_file_loc_
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+
+_fswf_fail:
+        ld sp, ix
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+
+#undefine _rom_page
+#undefine _inode_file_off
+; }}}
+
+
+;; Appends data to the end of a file.
+; See fs_write_file for some restrictions/warnings on the input.
+;
+; Paramters:
+;   hl - Inode number.
+;   (iy) - Data to write.
+;   bc - Length of data.
+; Return:
+;   c flag - Set on error, reset on success.
+;
+fs_append_file: ; {{{
+    ld a, b
+    or c
+    ret z
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        ld ix, 0
+        add ix, sp
+#define _rom_page -1
+        dec sp
+#define _inode_file_off -3
+        push hl
+
+        push bc
+            call fs_search_inode_
+            jr c, _fsaf_fail
+            out (PORT_MEM_BANK_A), a
+            ld (ix + _rom_page), a
+
+            ; Store the inode entry offset. If appending to the inode file, this
+            ; is not used, but save it anyway instead of checking.
+            ld (ix + _inode_file_off), e
+            ld (ix + _inode_file_off+1), d
+
+            ; Copy inode to kernel_tmp to modify it before copying to the
+            ; new file location.
+            ld de, kernel_tmp
+            ld bc, sizeof_inode
+            push hl
+                ldir
+            pop hl
+        pop bc
+
+        push hl
+            ; Get/increment size
+            ld hl, (kernel_tmp + inode_size)
+            add hl, bc
+            ld (kernel_tmp + inode_size), hl
+
+            ; Check if there is enough space
+            push bc
+                ld bc, sizeof_inode
+                add hl, bc
+                ld b, h \ ld c, l
+                call fs_find_space_
+                jr c, _fsaf_fail
+
+                ; Write the new inode
+                ld a, (fs_tail)
+                out (PORT_MEM_BANK_A), a
+                ld de, (fs_tail+1)
+                ld hl, kernel_tmp
+                ld bc, sizeof_inode
+                call flash_write_buf
+            pop bc ; Appended size
+
+        pop hl \ push hl ; (hl) = file
+
+            push bc
+                ; Write the existing part of the file (no need to check
+                ; for space again or change pages)
+
+                ; The size has to be found againn, but this is ieasier
+                ; than trying to save it from before.
+                ; inode_size = 2
+                inc hl \ inc hl
+                ld c, (hl)
+                inc hl
+                ld b, (hl)
+                ld a, sizeof_inode - inode_size - 1
+                add a, l
+                ld l, a
+                ld a, 0
+                adc a, h
+                ld h, a
+                ; de is already at the right place from flash_write_buf
+                ld a, (ix + _rom_page)
+                call flash_copy
+            pop bc ; Appended size
+
+            push iy \ pop hl
+            ; de is in the right place from previous write
+            call flash_write_buf
+            ; Ends with de after the end of the file, exactly where we
+            ; want it
+        pop hl
+
+        ; The entry in the inode file
+        ld c, (ix + _inode_file_off)
+        ld b, (ix + _inode_file_off+1)
+
+        ld a, (ix + _rom_page)
+
+        ld sp, ix
+
+        ; (hl) = old file
+        ; a = page of old file
+        ; (de) = after end of new file
+        ; (bc) = inode entry in the inode file
+        call fs_update_file_loc_
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+
+_fsaf_fail:
+        ld sp, ix
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    scf
+    ei
+    ret
+
+#undefine _rom_page
+#undefine _inode_file_off
+; }}}
+
+
+;; Writes the inode of a file, leaving the data the same, except that the size
+;; is truncated to the size in the inode.
+; Parameters:
+;   hl - The inode to modify.
+;   (iy) - The new inode data. This can be in ROM, but must not be mapped to
+;   memory bank A.
+; Return:
+;   c flag - Reset on success, set on error.
+;
+fs_write_inode_: ; {{{
+    ld ix, 0
+    add ix, sp
+
+    call fs_search_inode_
+    jp c, _fswi_fail
+
+#define _rom_page -1
+    push af
+    inc sp
+#define _inode_file_off -3
+    push hl
+
+    out (PORT_MEM_BANK_A), a
+    ld (ix + _inode_file_off), e
+    ld (ix + _inode_file_off+1), d
+
+    ld c, (iy + inode_size)
+    ld b, (iy + inode_size+1)
+
+    push hl
+        inc hl \ inc hl
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+
+        ; bc - New size
+        ; hl - Current size
+        or a ; TODO This is probably unnecessary
+        sbc hl, bc
+    pop de
+    ; (iy) - New inode
+    ; (de) - Old file
+
+    ; If new > current
+    jr c, _fswi_extend
+
+    ; Try to write the new inode over the current one and fall back to
+    ; copying the file
+    push iy \ pop hl
+    ld bc, sizeof_inode
+    push de
+    push hl
+        call flash_write_buf
+    pop hl
+    pop de
+    ; No need to update metadata if the file does not move.
+    jp nc, _fswi_return
+
+_fswi_copy:
+    ; (iy) - New inode
+    ; (de) - Old inode
+    ld c, (iy + inode_size)
+    ld b, (iy + inode_size+1)
+
+    ld hl, sizeof_inode
+    add hl, bc
+    ld b, h \ ld c, l
+
+    ; bc = size of file and inode
+    call fs_find_space_
+    jr c, _fswi_fail
+    ; (hl) - New file
+
+    ; Write the new inode
+    push bc
+    push de
+        ld a, (fs_tail)
+        out (PORT_MEM_BANK_A), a
+        ex de, hl ; (hl) = fs_tail offset from fs_find_space_
+        push iy \ pop hl
+        ld bc, sizeof_inode
+        ; (hl) - New inode
+        ; (de) - New file
+        call flash_write_buf
+        ; (hl) - End of new inode (obsolete)
+        ; (de) - New file data
+    pop hl ; (hl) - Old inode
+    pop bc
+
+    ; Save the start for fs_update_file_loc_
+    push hl
+        ld a, sizeof_inode
+        add a, l
+        ld l, a
+        ld a, 0
+        adc a, h
+        ld h, a
+        ; (hl) - Old data
+
+        ; Rtrieve the size again (easier/faster than saving it)
+        ld c, (iy + inode_size)
+        ld b, (iy + inode_size+1)
+        ld a, (ix + _rom_page)
+        call flash_copy
+    pop hl
+    jr _fswi_update_metadata
+
+_fswi_extend:
+    ; (iy) - New inode
+    ; (de) - Old inode
+    ld c, (iy + inode_size)
+    ld b, (iy + inode_size+1)
+
+    ld hl, sizeof_inode
+    add hl, bc
+    ld b, h \ ld c, l
+
+    ; bc = size of file and inode
+    call fs_find_space_
+    ; (hl) - New file
+    jr c, _fswi_fail
+
+    ; Copy the inode
+    push de
+        ld a, (fs_tail)
+        out (PORT_MEM_BANK_A), a
+        ex de, hl ; (hl) = fs_tail offset from fs_find_space_
+        push iy \ pop hl
+        ld bc, sizeof_inode
+        ; (hl) - New inode
+        ; (de) - New file
+        call flash_write_buf
+        ; (hl) - End of new inode (obsolete)
+        ; (de) - New file data
+    pop hl ; (hl) - Old inode
+
+    push hl
+        ; Get the old size
+        inc hl \ inc hl ; inode_size = 2
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+
+        ld a, sizeof_inode - inode_size - 1
+        add a, l
+        ld l, a
+        ld a, 0
+        adc a, h
+        ld h, a
+        ; (hl) - Old data
+
+        ld a, (ix + _rom_page)
+        call flash_write_buf
+    pop hl
+    ;jr _fswi_update_metadata
+
+_fswi_update_metadata:
+    ld a, (ix + _rom_page)
+    ld c, (ix + _inode_file_off)
+    ld b, (ix + _inode_file_off+1)
+    ; (hl) - Old file
+    ; (de) - End of new file
+    ; a - Page of new file
+    ; (bc) - Inode entry address
+    push ix
+        call fs_update_file_loc_
+    pop ix
+
+_fswi_fail:
+    scf
+
+_fswi_return:
+    ld sp, ix
+    ret
+
+#undefine _rom_page
+#undefine _inode_file_off
+; }}}
+
+
+;; Creates a directory entry in a directory.
+; TODO Make sure the directory exists before appeending to it ? fs_append_file
+; does this anyway so it's not a big deal.
+; Parameters:
+;   hl - The inode of the directory in which to create the entry.
+;   (de) - The name of the entry to create.
+;   bc - The inode number of the entry to create.
+; Return:
+;   c flag - Reset if the entry could be added, set otherwise.
+;
+fs_create_direntry: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        push bc
+        push de
+        push hl
+            ld h, b \ ld l, c
+            call fs_search_inode_
+            jr c, _fscd_inc_nlinks_end
+
+            out (PORT_MEM_BANK_A), a
+
+            ; Prepare the inode but don't copy it until after the entry is added
+            ; in case of an error.
+            ; fs_append_file uses this buffer too.
+            ld de, kernel_tmp + sizeof_inode + sizeof_inode
+            ld bc, sizeof_inode
+            ldir
+
+            ld hl, kernel_tmp + sizeof_inode + sizeof_inode + inode_nlinks
+            ld a, (hl)
+            or a ; Reset carry (not affected by inc)
+            inc a
+            ; Check overflow
+            jr nz, _
+            scf
+_:
+            ld (hl), a ; Doing this doesn't hurt anything
+_fscd_inc_nlinks_end:
+        pop hl
+        pop de
+        pop bc
+        jr c, _fscd_fail
+
+        push bc
+            ; TODO Move this above to avoid pushing hl again
+            push hl
+                ld hl, kernel_tmp + sizeof_inode + sizeof_inode + sizeof_inode
+                ld (hl), c
+                inc hl
+                ld (hl), b
+                inc hl
+                ex de, hl
+                ld bc, NAME_MAX ; Always copy 14 bytes for simplicity
+                ldir
+            pop hl
+            ld iy, kernel_tmp + sizeof_inode + sizeof_inode + sizeof_inode
+            ld bc, sizeof_fs_direntry
+            push ix
+                call fs_append_file ; TODO Sort entries?
+            pop ix
+            ; TODO Check errors
+        pop hl ; entry inode
+
+        ; TODO Do this first to make sure the file exists.
+        ld iy, kernel_tmp + sizeof_inode + sizeof_inode
+        call fs_write_inode_
+        ; TODO Check errors
+
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+
+_fscd_fail:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Creates a new inode entry in the inode file.
+; This first searches the inode file to find a free inode number, erroring if
+; there are no more or there is no space for more available (the latter case
+; would likely happen first).
+;
+; Parameters:
+;   (hl) - The start of the inode's data (from ROM bank A).
+;   a - The ROM page of the inode.
+; Return:
+;   c flag - Reset if the new inode was created, set if there was an error.
+;   hl - The inode number of the new inode.
+; Preserves:
+;   ix
+;
+fs_create_ientry_: ; {{{
+    ld b, a ; Store the page
+    ; TODO Interrupts are probably disabled anyway from any function which calls
+    ; this (fs_create_file is and should be the only one), so this is probably
+    ; unnecessary.
+    or a
+    ld a, i
+    push af
+        di
+
+        ; These are popped as af and bc
+        push bc
+        push hl
+            ; Find next open inode. For now, this simply looks through
+            ; all inodes in the inode file and adds 1 to the largest.
+            ; TODO If entries are sorted, this can search through until
+            ; it finds a gap.
+            ld a, (fs_inode_file)
+            out (PORT_MEM_BANK_A), a
+
+            ld hl, (fs_inode_file+1)
+
+            ; Get size of the inode file
+            inc hl
+            inc hl
+            ld c, (hl)
+            inc hl
+            ld b, (hl)
+            ld a, sizeof_inode - 3
+            add a, l
+            ld l, a
+            ld a, 0
+            adc a, h
+            ld h, a
+
+            ; Input:
+            ;   (hl) - Next inode entry.
+            ;   de - Current maximum inode value.
+            ;   bc - Number of entries left (times sizeof_inode_entry).
+            ld de, 0
+_fsci_find_inode:
+            ; Compare MSB first
+            inc hl
+            ld a, (hl)
+            dec hl
+            cp d
+            jr c, _fsci_next_inode
+            jr nz, _fsci_inode_gt
+            ; MSB's are the same
+            ld a, e
+            cp (hl)
+            jr nc, _fsci_next_inode
+
+_fsci_inode_gt:
+            ld e, (hl)
+            inc hl
+            ld d, (hl)
+            dec hl
+
+_fsci_next_inode:
+            inc hl
+            inc hl
+            inc hl
+            inc hl
+            inc hl
+
+            ; Subtract sizeof_inode_entry
+            ld a, c
+            add a, -sizeof_inode_entry
+            ld c, a
+            ld a, $FF
+            adc a, b
+            ld b, a
+            or c
+            jr nz, _fsci_find_inode
+
+_fsci_find_inode_end:
+            inc de
+            ; Make sure this did not overflow
+            ld a, d
+            or e
+            jr nz, _
+        pop hl
+        pop af
+        jr _fsci_fail
+_:
+            ; Now add the entry by appending to the inode file just like any other
+            ; file.
+            ; fs_append_file uses the beginning of kernel_tmp.
+            ld hl, kernel_tmp + sizeof_inode + sizeof_inode
+            ld (hl), e
+            inc hl
+            ld (hl), d
+        pop bc ; Put the address in bc since hl is in use
+        pop af
+
+        inc hl
+        ld (hl), a
+        inc hl
+        ld (hl), c
+        inc hl
+        ld (hl), b
+
+        push de ; Save the inode number
+            ld iy, kernel_tmp + sizeof_inode + sizeof_inode
+            ld bc, sizeof_inode_entry
+            ld hl, 0 ; Inode file's inode
+            call fs_append_file ; TODO Sort entries ?
+            ; TODO Check errors
+        pop hl
+
+_fsci_return:
+    pop af
+    ret po
+    ei
+    ret
+
+_fsci_fail:
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Creates a new file.
+; Parameters:
+;   hl - The inode of the parent directory.
+;   (de) - The name of the file to create.
+;   bc - The mode of the file.
+; Return:
+;   c flag - Reset if the file could be created, set otherwise.
+;   hl - The inode of the created file.
+; Preserves:
+;   None
+;   TODO Use iy instead of ix as the frame pointer to avoid using ix.
+;
+fs_create_file: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        ld ix, 0
+        add ix, sp
+
+        push hl ; Save the inode for later
+            push bc
+            push de
+                push hl
+                    ; Make sure there is enough space (this only checks for the
+                    ; new inode, not the directory entry or the inode file
+                    ; entry, which are checked when they are written).
+                    ld bc, sizeof_inode
+                    call fs_find_space_
+                    jp c, _fscf_fail
+                pop hl
+            pop de \ push de
+
+                ; Make sure the directory exists and save its GID in iyh
+                call fs_search_inode_
+                jr c, _fscf_fail
+                ; inode_gid = 5
+                inc hl \ inc hl \ inc hl \ inc hl \ inc hl
+                ld a, (hl)
+                ld iyh, a
+            pop de
+            pop bc
+
+            push de
+                ; Write the inode to a buffer then copy it over.
+                ld hl, kernel_tmp
+                ld (hl), c
+                inc hl
+                ld (hl), b
+                ; Size = 0
+                xor a
+                inc hl
+                ld (hl), a
+                inc hl
+                ld (hl), a
+                ; UID of the current process
+                ld de, (cur_process)
+                ; proc_ent_uid = 1
+                inc de
+                ld a, (de)
+                inc hl
+                ld (hl), a
+                ; GID of the parent directory (retrieved above)
+                ld a, iyh
+                inc hl
+                ld (hl), a
+                ; nlinks = 0 (To be incremented when the directory entry is
+                ; created)
+                xor a
+                inc hl
+                ld (hl), a
+
+                ; Type in MSB
+                ld a, b
+                and S_IFMT >> 8
+                cp S_IFDIR >> 8
+                jr z, _fscf_prep_dir_inode
+
+_fscf_prep_reg_inode:
+                ld bc, sizeof_inode
+                jr _fscf_write_inode
+
+_fscf_prep_dir_inode:
+            pop bc
+        pop de ; Get the parent directory inode
+        push de
+            push bc
+                ; ".." entry
+                inc hl
+                ld (hl), e
+                inc hl
+                ld (hl), d
+                ld a, '.'
+                inc hl
+                ld (hl), a
+                inc hl
+                ld (hl), a
+                xor a
+                inc hl
+                ld (hl), a
+                ; No need to fill the rest of the name portion
+
+                ; Set size to sizeof_fs_direntry
+                ld hl, kernel_tmp + inode_size
+                ld bc, sizeof_fs_direntry
+                ld (hl), c
+                inc hl
+                ld (hl), b
+
+                ld bc, sizeof_inode + sizeof_fs_direntry
+                ;jr _fscf_write_inode
+
+_fscf_write_inode:
+                ld de, (fs_tail+1)
+                ld hl, kernel_tmp
+                push bc
+                    call flash_write_buf
+                pop bc
+
+                ; Update fs_tail
+                ld hl, (fs_tail+1)
+                ; Save original tail since this is the start of the new inode
+                ; (needed for the inode file).
+                ld d, h \ ld e, l
+                add hl, bc
+                ld (fs_tail+1), hl
+                ex de, hl
+
+_fscf_add_ientry:
+                in a, (PORT_MEM_BANK_A)
+                ; (hl) - Inode address
+                ; a - Page
+                call fs_create_ientry_
+                ; TODO Check error status
+
+                ld b, h \ ld c, l ; For fs_create_direntry
+_fscf_add_direntry:
+            pop de ; The name
+        pop hl ; The inode of the directory
+
+        ; hl - Inode of directory.
+        ; (de) - Name of entry.
+        ; bc - Inode of entry.
+        push bc
+            call fs_create_direntry
+        pop hl
+        ; TODO Check error status
+
+_fscf_return:
+        ;ld sp, ix
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+
+_fscf_fail:
+        ld sp, ix
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Deletes a directory entry.
+; TODO Should this just zero-out the entry and let the garbage collector and/or
+; fs_create_direntry remove empty entries?
+; Parameters:
+;   hl - The inode of the parent directory.
+;   (de) - The name of the entry to delete.
+; Return:
+;   c flag - Reset on success, set if the file was not found.
+; Preserves:
+;   ix
+;
+fs_delete_direntry: ; {{{
+    ; For now, to keeps things simple, this just zeros-out the entry
+    ;call strlen ; TODO Implement (maybe)
+    ex de, hl
+    push hl
+        xor a
+        ld c, a
+_:
+        cp (hl)
+        jr z, _
+        inc c
+        inc hl
+        jr -_
+_:
+    pop hl
+    ex de, hl
+
+    or a ; Reset carry
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+        call fs_search_dir
+        jr c, _fsdd_fail
+
+        push hl
+            ; TODO Use fs_write_file ?
+            ; Copy to a buffer to write all at once
+            ld hl, kernel_tmp
+            xor a
+            ld b, sizeof_fs_direntry
+_:
+            ld (hl), a
+            inc hl
+            djnz -_
+
+            ld hl, kernel_tmp
+            ld bc, sizeof_fs_direntry
+            call flash_write_buf
+        pop hl
+        ; We are writing 0s, so there shouldn't be an error, but check just in
+        ; case
+        jr c, _fsdd_fail
+
+        ; hl - Entry inode
+        push hl \ pop iy ; TODO Don't use iy
+        call fs_search_inode_
+        jr c, _fsdd_fail
+
+        out (PORT_MEM_BANK_A), a
+
+        push hl
+            ld de, kernel_tmp
+            ld bc, sizeof_inode
+            ldir
+            ld hl, kernel_tmp + inode_nlinks
+            ld a, (hl)
+            dec a
+            ld (hl), a
+        pop de ; (de) - Inode address
+        jr nz, _
+        ; If nlinks == 0
+        push iy \ pop hl
+        call fs_delete_ientry_
+        jr _fsdd_return
+_:
+
+        ld iy, kernel_tmp
+        call fs_write_inode_
+_fsdd_return:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+
+_fsdd_fail:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Deletes an inode an its file data.
+; TODO Should this just zero-out the entry and let the garbage collector and/or
+; fs_update_file_loc_ remove empty entries? This would probably be more
+; difficult and it is for directories and it removes the prospect of sorting the
+; entries.
+; Parameters:
+;   hl - The inode to delete.
+; Return:
+;   c flag - Reset on success, set if the inode was not found.
+;
+fs_delete_ientry_: ; {{{
+    ; For now, to keeps things simple, this just zeros-out the entry
+    call fs_search_inode_
+    ret c
+    ; (de) - Inode entry
+
+    out (PORT_MEM_BANK_A), a
+
+    ; Mark the inode for deletion
+    ld a, (S_IDEL | ~S_IFMT) >> 8 & $FF
+    ; inode_mode = 0
+    inc hl ; Write to MSB
+    and (hl)
+    push de
+        call flash_write_byte
+    pop de
+
+    ; TODO Use fs_write_file ?
+    ; Copy to a buffer to write all at once
+    ld hl, kernel_tmp
+    xor a
+    ld b, sizeof_inode_entry
+_:
+    ld (hl), a
+    inc hl
+    djnz -_
+
+    ld hl, kernel_tmp
+    ld bc, sizeof_fs_direntry
+    ; Return with its status. (It should be nc, since we are only writing 0s.)
+    jp flash_write_buf
+; }}}
+
+
+;; Garbage collects the filesystem, freeing up space if possible.
+; This also removes deleted entries from directories and the inode file, and so
+; is called when one reaches its maximum size in addition to when the filesystem
+; tail reaches the end of the allocated space.
+;
+fs_garbage_collect_: ; {{{
+    ; This works backwards from the end so that the inode file can be
+    ; written/allocated first. Since the locations of all of the files will
+    ; change during garbage collection, the inode file is written with empty
+    ; (filled with 1s) locations, only containing the inode numbers.
+    ret
+; }}}
+
+
+;; Erases the anchor block and writes the offsets at their initial locations.
+; TODO Should this be merged with fs_garbage_collect_ ?
+;
+fs_garbage_collect_anchor_: ; {{{
+    ret
+; }}}
+

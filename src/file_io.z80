@@ -1,0 +1,1175 @@
+;
+; file_io.z80
+;
+; Base file I/O functions.
+;
+; TODO Check permissions everywhere
+;
+
+#include "errno.inc"
+#include "fcntl.inc"
+#include "filesystem.inc"
+#include "memmap.inc"
+#include "unistd.inc"
+
+
+;; Get/set file descriptor options.
+; int fcntl(int fildes, int cmd, ...);
+; The third argument is used for some commands (see fcntl(2)) as an int or
+; pointer.
+;
+; Parameters:
+;   a  - The file descriptor.
+;   [d]e - The command.
+;   bc - Third (optional) argument, if applicable. See documentation for the
+;   type/meaning of this.
+; Return:
+;   hl - Depends on the command.
+; Preserves:
+;   ix, iy
+;
+fcntl: ; {{{
+    ld d, a
+    push de
+        call fildes_deref
+        ; (hl) = fd
+    pop de ; d = fd index
+    jp c, _fcntl_ebadf
+    jp z, _fcntl_ebadf
+
+    ; TODO Make this a jump table?
+    ld a, e ; Command is only in the LSB
+    cp F_DUPFD
+    jr z, _fcntl_dupfd
+    cp F_DUPFD_CLOEXEC
+    jr z, _fcntl_dupfd_cloexec
+    cp F_GETFD
+    jr z, _fcntl_getfd
+    cp F_SETFD
+    jr z, _fcntl_setfd
+    cp F_GETFL
+    jr z, _fcntl_getfl
+    cp F_SETFL
+    jr z, _fcntl_setfl
+    cp F_GETLK
+    jr z, _fcntl_getlk
+    cp F_SETLK
+    jr z, _fcntl_setlk
+    cp F_SETLKW
+    jr z, _fcntl_setlkw
+    cp F_GETOWN
+    jr z, _fcntl_getown
+    cp F_SETOWN
+    jr z, _fcntl_setown
+
+    ld hl, EINVAL
+    jr _fcntl_error
+
+_fcntl_dupfd: ; Copy the file descriptor to a new one >= arg.
+    ld a, d
+    ; c = after index
+    ; TODO Error if b != 0
+    call dup_after
+    ld h, 0
+    ld l, a
+    ret
+
+_fcntl_dupfd_cloexec:
+    call _fcntl_dupfd
+    ret c
+
+    ; Setting the flag does not need to be atomic since it only affects this
+    ; process.
+    push hl
+        ld a, l
+        call fildes_deref
+        ; No need to check for errors again
+        ; Set the FD_CLOEXEC bit.
+        ld a, (hl)
+        or FD_CLOEXEC
+        ld (hl), a
+    pop hl
+    ; Carry reset from or instruction
+    ret
+
+_fcntl_getfd:
+    ; Only reads the process's file descriptor, so this need not be atomic
+    ; Get the FD_CLOEXEC byte
+    ld a, (hl)
+    ; No reason to clear the rest of the bits
+    ld h, 0
+    ld l, a
+    ret
+
+_fcntl_setfd:
+    ; Only writes the process's file descriptor, so this need not be atomic
+    ; Reset the bit at (hl)
+    ld a, (hl)
+    and ~FD_CLOEXEC & $FF
+    ld b, a
+    ld a, c
+    and FD_CLOEXEC
+    or b
+    ld (hl), a
+    ld h, 0 ; hl != -1
+    ret
+
+_fcntl_getfl:
+    ; TODO Disable interrupts
+    ld a, (hl)
+    call filtab_deref
+    ; Since the file descriptor is valid and non-empty, it can be assumed there
+    ; is a valid file table entry, but check just in case
+    jr c, _fcntl_ebadf
+    jr z, _fcntl_ebadf
+
+    ; filtab_ent_flags = 2
+    ; Only the LSB flags need to be returned (also, the MSB flags could make the
+    ; value negative)
+    inc hl
+    inc hl
+    ld a, (hl)
+    ld h, 0
+    ld l, a
+    ret
+
+_fcntl_setfl:
+    ; TODO Disable interrupts
+    ld a, (hl)
+    call filtab_deref
+    ; Since the file descriptor is valid and non-empty, it can be assumed there
+    ; is a valid file table entry, but check just in case
+    jr c, _fcntl_ebadf
+    jr z, _fcntl_ebadf
+
+    ; filtab_ent_flags = 2
+    inc hl
+    inc hl
+
+    ; Only bits in the LSB not part of the access mode can be changed.
+    ; Zero-out these flags at (hl)
+    ld a, (hl)
+    and O_ACCMODE
+    ld b, a
+    ; Set to the new flags.
+    ld a, c
+    and ~O_ACCMODE & $FF
+    or a, b
+    ld a, (hl)
+    ld h, 0 ; hl != -1
+    ret ; Carry reset from bit instructions
+
+    ; TODO Implement the rest
+_fcntl_getlk:
+_fcntl_setlk:
+_fcntl_setlkw:
+_fcntl_getown:
+_fcntl_setown:
+
+_fcntl_enoimpl:
+    ld hl, ENOIMPL
+    jr _fcntl_error
+
+_fcntl_ebadf:
+    ld hl, EBADF
+    ;jr _fcntl_error
+
+_fcntl_error:
+    call proc_set_errno
+    ld hl, -1
+    scf
+    ret
+; }}}
+
+
+;; Opens a file and returns a file descriptor to it, if possible.
+; Parameters:
+;   (de) - Path string.
+;   hl - OR of the flags for opening the file (see fcntl.inc).
+;   bc - Mode for creating a new file (if a file is not created, this is not
+;   used).
+; Return:
+;   c flag - Reset on success, set on error.
+;   a - A new file descriptor for the opened file, or -1 if an error occurs.
+;
+open: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        push bc ; file mode
+            push hl ; flags
+                ; Search in 2 stages to know if the file exists or can be
+                ; created.
+                call resolve_path_dir
+                jr nc, _
+            pop hl
+        pop bc
+        ld hl, ENOENT
+        jp _open_error
+_:
+
+                call resolve_path_at
+                jr c, _open_not_found
+_open_found:
+                ; hl = file inode
+            pop bc ; bc = flags
+        pop af ; These are only passed when creating a file, so meaningless here
+
+        ; Creation flags are in the MSB
+        ld a, b
+        and (O_CREAT | O_EXCL) >> 8
+        cp (O_CREAT | O_EXCL) >> 8
+        jr nz, _
+        ; Both are specified and the file was found
+        ld hl, EEXIST
+        jp _open_error
+_:
+
+        ; Get and save the mode since it is needed later
+        push bc
+        push de
+            call fs_get_mode
+            push bc \ pop iy ; iy = file mode
+        pop de
+        pop bc
+
+        ; If O_DIRECTORY, the file must be a directory
+        ld a, b
+        and O_DIRECTORY >> 8
+        jr z, _
+        ld a, iyh
+        and S_IFMT >> 8
+        cp S_IFDIR >> 8
+        jr z, _
+        ld hl, ENOTDIR
+        jp _open_error
+_:
+
+        ; TODO Check permissions
+        ld a, c ; Access mode flags are in the LSB
+        push bc
+        push hl
+            call perm_check_file
+        pop hl
+        pop bc
+        ; Since the file was found by fs_search_dir, there is no need to check
+        ; if c was set by perm_check_file().
+        jr z, _
+        ld hl, EACCES
+        jp _open_error
+_:
+
+        ; Truncate the file if necessary
+        ; TODO Do some type checking on the file ?
+        ld a, b ; MSB
+        and O_TRUNC >> 8
+        jr z, _
+        push bc
+        push hl ; TODO Save more registers ?
+            ld bc, 0
+            call fs_truncate_file
+        pop hl
+        pop bc
+        jr nc, _
+        ld hl, EIO
+        jr _open_error
+_:
+        ; Combine the mode with the flags
+        ld b, iyh
+        jr _open_alloc_fd
+
+_open_not_found:
+            ; hl = directory inode
+            ; (de) = filename
+            pop bc ; bc = flags
+
+            ; Creation flags are in the MSB
+            ld a, b
+            and O_CREAT >> 8
+            jr nz, _
+        pop bc
+        ld hl, ENOENT
+        jr _open_error
+_:
+
+            ; Write permission is needed on the directory to create a file.
+            ld a, O_WRONLY
+            push bc
+            push de
+            push hl
+                call perm_check_file
+            pop hl
+            pop de
+            pop iy ; Save flags (iy is used in fs_create_file anyway)
+            ; Since the file was found by fs_search_dir, there is no need to
+            ; check if c was set by perm_check_file().
+            jr z, _
+        pop bc
+        ld hl, EACCES
+        jr _open_error
+_:
+
+            ; Get the complete mode for fs_create_file, but push the combined
+            ; flags (open flags and file creation mode) to the stack for storing
+            ; in the file description.
+
+        pop bc ; bc = mode
+        ; iy = open flags (from above)
+        ld c, iyl
+        push bc
+            ; Create the file
+            ; hl = Directory inode
+            ; bc = flags
+            ; (de) = start of last path segment (the one to be created)
+            call fs_create_file
+        pop bc ; Combined flags
+
+        ;jr _open_alloc_fd
+
+_open_alloc_fd:
+        ; Process the file if it is a not a regular file, link, or directory.
+        push bc
+        push de
+            ; TODO Put mode in iy in _open_not_found to avoid finding it again
+            call fs_get_mode
+            ; Type in MSB
+            ld a, b
+            and S_IFMT >> 8
+            cp S_IFREG >> 8
+            jr z, _open_reg
+            cp S_IFDIR >> 8
+            jr z, _open_dir
+            cp S_IFLNK >> 8
+            jr z, _open_lnk
+            cp S_IFCHR >> 8
+            jr z, _open_chr
+            cp S_IFBLK >> 8
+            jr z, _open_blk
+            cp S_IFIFO >> 8
+            jr z, _open_fifo
+
+            ; Invalid file
+        pop de
+        pop bc
+        ld hl, EIO
+        jr _open_error
+
+_open_reg:
+_open_dir:
+_open_lnk:
+            ; For these, do nothing special
+        pop de
+        pop bc
+        jr _open_finish
+
+_open_chr:
+_open_blk:
+            ; Process the device
+            call device_get_ident
+        pop de
+        pop bc
+        jr _open_finish
+
+_open_fifo:
+            ; TODO Figure out what do to with these
+        pop de
+        pop bc
+        ld hl, ENOIMPL
+        jr _open_error
+
+_open_finish:
+        call fildes_open
+        jr c, _
+        ld l, a
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ld a, l
+    ret po
+    ei
+    ret
+_:
+
+        ; If the file descriptor could not be opened
+        ld hl, EMFILE
+        ;jr _open_error
+
+_open_error:
+        call proc_set_errno
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Creates a special file.
+; Parameters:
+;   l - Device type (0 for FIFOs).
+;   h - Device identifier.
+;   (de) - Path at which to create the special file.
+;   bc - Mode for creating the file.
+; Return:
+;   c flag - Reset if the special file was successfully created, set otherwise.
+; Preserves:
+;   hl
+;
+mknod: ; {{{
+    or a ; Reset carry for returning
+    ld a, i
+    push af
+        di
+
+        push hl
+            push bc
+                call resolve_path_dir
+                jr nc, _
+            pop bc
+        pop hl
+        ld hl, ENOENT
+        jr _mknod_error
+_:
+
+                call resolve_path_at
+            pop bc ; File mode
+            ; The file cannot already exist
+            jr c, _
+        pop hl
+        ld hl, EEXIST
+        jr _mknod_error
+_:
+
+            ; TODO Check the filetype
+
+            ; If the file does not exist,
+            ;   hl = parent directory
+            ;   (de) = filename
+            call fs_create_file
+            jr nc, _
+        pop hl
+        ld hl, ENOSPC
+        jr _mknod_error
+_:
+
+            ; The data to write is on the stack, pushed at the start of the function
+            ld iy, 0
+            add iy, sp
+            ld bc, 2
+            call fs_append_file
+        pop hl
+        jr c, _
+    pop af
+    ret po
+    ei
+    ret
+
+_:
+        ld hl, ENOSPC
+        ; jr _mknod_error
+
+_mknod_error:
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Creates a file.
+; This is equivalent to (and implemented as):
+;   open(path, O_WRONLY|O_CREAT|O_TRUNC, mode);
+; Parameters:
+;   (de) - The path of the file to create.
+;   bc - The mode to create the new file.
+; Return:
+;   c flag - Reset on success, set on failure.
+;   hl - An open file descriptor for the new file, or -1 if an error occurred.
+;
+creat: ; {{{
+    ld hl, O_WRONLY | O_CREAT | O_TRUNC
+    jp open
+; }}}
+
+
+;; Reads data from a file.
+;
+; Parameters:
+;   a - The file descriptor of the file to read from.
+;   (iy) - A buffer to read into. This must be in RAM to work.
+;   bc - The maximum number of bytes to read.
+; Return:
+;   c flag - Reset if the read was successful, set if an error occurred.
+;   bc - The number of bytes read, or -1 if an error occurred.
+; Preserves:
+;   a, ix, iy
+;
+read: ; {{{
+    ; TODO Do interrupts need to be disabled here? The file description flags
+    ; (such as O_NONBLOCK) could be changed from other processes during the
+    ; execution of this, though that would not really break the execution.
+    push af
+        call fildes_deref_full
+        jr nc, _
+        ld hl, EBADF
+        jr _read_error
+_:
+
+        push hl
+            ex (sp), iy
+            ; (hl) = (iy) = file descriptor
+            ; (sp) = buffer
+
+            ; access mode in LSB
+            ld a, (iy + filtab_ent_flags)
+            and O_RDONLY
+            jr nz, _
+        pop iy
+        ld hl, EBADF
+        jr _read_error
+_:
+
+            ld e, (iy + filtab_ent_offset)
+            ld d, (iy + filtab_ent_offset+1)
+
+            ld l, (iy + filtab_ent_inode)
+            ld h, (iy + filtab_ent_inode+1)
+
+            ld a, (iy + filtab_ent_flags+1) ; Type in MSB
+
+            ex (sp), iy
+            ; a = type
+            ; hl = inode
+            ; (iy) = buffer
+            ; ((sp)) = file descriptor
+
+            ; Look at the type to see how to read from the file
+            ; All sub-routines take the parameters:
+            ;   hl - Inode/device of the file.
+            ;   (iy) - The buffer to read into.
+            ;   ((sp)) - The file table entry.
+            ;   bc - The number of bytes to read.
+            ; and should return as described above.
+            ;
+
+            and S_IFMT >> 8
+            cp S_IFREG >> 8
+            jr z, _read_reg
+            cp S_IFDIR >> 8
+            jr z, _read_dir
+            cp S_IFLNK >> 8
+            jr z, _read_lnk
+            cp S_IFCHR >> 8
+            jr z, _read_chr
+            cp S_IFBLK >> 8
+            jr z, _read_blk
+            cp S_IFIFO >> 8
+            jr z, _read_fifo
+
+            ; Invalid file
+        pop iy
+        ld hl, EIO
+        jr _read_error
+
+_read_reg:
+_read_dir:
+_read_lnk:
+            call fs_read_file
+            jr _read_update_offset
+
+_read_chr:
+_read_blk:
+            call device_read
+            ; TODO Update the offset ?
+            jr _read_update_offset
+
+_read_fifo:
+        pop af
+        ld hl, ENOIMPL
+        jr _read_error
+
+_read_update_offset:
+            ; (sp) = buffer
+            ; (iy) = file description
+            ex (sp), iy
+            ; Don't update the offset on error
+            jr c, _
+            ld l, (iy + filtab_ent_offset)
+            ld h, (iy + filtab_ent_offset+1)
+            add hl, bc ; Does not modify flags
+            ld (iy + filtab_ent_offset), l
+            ld (iy + filtab_ent_offset+1), h
+_:
+        pop iy ; iy = buffer
+        jr c, _
+    pop af
+    or a
+    ret
+
+_:
+        ld hl, EIO
+        ;jr _read_error
+
+_read_error:
+        call proc_set_errno
+    pop af
+    ld bc, -1
+    scf
+    ret
+; }}}
+
+
+;; Writes data to a file.
+;
+; Parameters:
+;   a - The file descriptor of the file to write to.
+;   (iy) - A buffer to read from. This must be in RAM to work.
+;   bc - The number of bytes to write.
+; Return:
+;   c flag - Reset if the write was successful, set if an error occurred.
+;   bc - The number of bytes written, or -1 if an error occurred. TODO Implement
+;   this in fs_write_file/fs_append_file.
+; Preserves:
+;   a
+;
+write: ; {{{
+    ; TODO Do interrupts need to be disabled here? The file description flags
+    ; (such as O_NONBLOCK) could be changed from other processes during the
+    ; execution of this, though that would not really break the execution.
+    push af
+        call fildes_deref_full
+        jr nc, _
+        ld hl, EBADF
+        jp _write_error
+_:
+
+        push hl
+            ex (sp), iy
+            ; (hl) = (iy) = file descriptor
+            ; (sp) = buffer
+
+            ; access mode in LSB
+            ld a, (iy + filtab_ent_flags)
+            and O_WRONLY
+            jr nz, _
+        pop hl
+        ld hl, EBADF ; TODO Is this the correct error?
+        jr _write_error
+_:
+
+            ; Get the offset even if in append mode to make things simpler
+            ld e, (iy + filtab_ent_offset)
+            ld d, (iy + filtab_ent_offset+1)
+
+            ld l, (iy + filtab_ent_inode)
+            ld h, (iy + filtab_ent_inode+1)
+
+            ld a, (iy + filtab_ent_flags+1) ; Type in MSB
+
+            ; a = type
+            ; hl = inode
+            ; (iy) = file descriptor
+            ; ((sp)) = buffer
+
+            ; Look at the type to see how to write to the file. These routines must
+            ; check the append flag if they support offsets (otherwise, there is no
+            ; distinction between write and append mode).
+            ; All sub-routines take the parameters:
+            ;   hl - Inode/device of the file.
+            ;   (iy) - The file table entry.
+            ;   ((sp)) - The buffer to read into.
+            ;   bc - The number of bytes to read.
+            ; and should return as described above, with:
+            ;   (iy) - The buffer to read into.
+            ;   ((sp)) - The file description.
+            ;
+
+            and S_IFMT >> 8
+            cp S_IFREG >> 8
+            jr z, _write_reg
+            cp S_IFDIR >> 8
+            jr z, _write_dir
+            cp S_IFLNK >> 8
+            jr z, _write_lnk
+            cp S_IFCHR >> 8
+            jr z, _write_chr
+            cp S_IFBLK >> 8
+            jr z, _write_blk
+            cp S_IFIFO >> 8
+            jr z, _write_fifo
+
+_write_reg:
+_write_dir:
+_write_lnk:
+            ; access mode in LSB
+            ld a, (iy + filtab_ent_flags)
+            ex (sp), iy
+            and O_APPEND
+            jr nz, _write_reg_append
+
+            push bc
+                call fs_write_file
+                ; TODO Make fs_write_file return the number of bytes written
+            pop bc
+            jr _write_update_offset
+
+_write_reg_append:
+            push bc
+                call fs_append_file
+                ; TODO Make fs_append_file return the number of bytes written
+            pop bc
+            jr _write_update_offset
+
+_write_chr:
+_write_blk:
+            ; For devices which do not support offsets, the write and append
+            ; functions will be the same, so don't make any distinction here.
+            ld a, (iy + filtab_ent_flags) ; access mode in LSB
+            ex (sp), iy
+            and O_APPEND
+            jr nz, _write_spec_append
+
+            call device_write
+            jr _write_update_offset
+
+_write_spec_append:
+            call device_append
+            jr _write_update_offset
+
+_write_fifo:
+        pop af ; Keep iy
+        ld hl, ENOIMPL
+        jr _write_error
+
+_write_update_offset:
+            ; Don't update the offset on error
+            jr c, _
+            ex (sp), iy
+            ld l, (iy + filtab_ent_offset)
+            ld h, (iy + filtab_ent_offset+1)
+            add hl, bc
+            ld (iy + filtab_ent_offset), l
+            ld (iy + filtab_ent_offset+1), h
+        pop iy ; (iy) = buffer
+        jr c, _
+    pop af
+    or a
+    ret
+_:
+        ld hl, EIO
+        ; jr _write_error
+
+_write_error:
+        call proc_set_errno
+    pop af
+    ld bc, -1
+    scf
+    ret
+; }}}
+
+
+;; Truncates a file to a specified length.
+; Parameters:
+;   hl - The file descriptor of the file.
+;   bc - The new length.
+; Return:
+;   c flag - Set on error, reset on success.
+; Preserves:
+;
+ftruncate: ; {{{
+    ; TODO Do interrupts need to be disabled here? The file description flags
+    ; (such as O_NONBLOCK) could be changed from other processes during the
+    ; execution of this, though that would not really break the execution.
+    call fildes_deref_full
+    ret c
+
+    ; filtab_ent_inode = 0
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+
+    jp fs_truncate_file
+; }}}
+
+
+;; Sets the offset of a file descriptor.
+; Parameters:
+;   a - The file descriptor.
+;   [d]e - The position in the file that the offset is relative to (one of
+;   SEEK_SET, SEEK_CUR, or SEEK_END).
+;   bc - The new offset.
+; Return:
+;   c flag - Set on error, reset on success.
+;   bc - Offset from the start of the file.
+; Preserves:
+;   a, ix, iy
+;
+lseek: ; {{{
+    or a
+    ld d, a ; Position value is single-byte
+    ld a, i
+    push af
+        di
+        ld a, d
+
+        push af
+            call fildes_deref_full
+            jr c, _lseek_ebadf
+
+            ; TODO Type checking on the file
+
+            ld a, e
+            cp SEEK_SET
+            jr z, _lseek_set
+            cp SEEK_CUR
+            jr z, _lseek_cur
+            cp SEEK_END
+            jr z, _lseek_end
+
+            jr _lseek_einval
+
+_lseek_set:
+            ; filtab_ent_offset = 4
+            inc hl
+            inc hl
+            inc hl
+            inc hl
+            ld (hl), c
+            inc hl
+            ld (hl), b
+            ; Don't need to change bc
+            jr _lseek_done
+
+_lseek_cur:
+            ; filtab_ent_offset = 4
+            inc hl
+            inc hl
+            inc hl
+            inc hl
+            ld e, (hl)
+            inc hl
+            ld d, (hl)
+            ex de, hl
+            add hl, bc
+            ld b, h \ ld c, l
+            ex de, hl
+            ld (hl), b
+            dec hl
+            ld (hl), c
+            jr _lseek_done
+
+_lseek_end:
+            push bc
+            push hl
+                ; filtab_ent_inode = 0
+                ld a, (hl)
+                inc hl
+                ld h, (hl)
+                ld l, a
+                call fs_get_size
+                ; The file descriptor is (assumed) valid since it passed
+                ; filde_deref, so there is no need to check for errors here.
+                ld h, b \ ld l, c
+            pop de
+            pop bc
+
+            add hl, bc
+            ld b, h \ ld c, l
+
+            inc hl
+            inc hl
+            inc hl
+            ld (hl), c
+            inc hl
+            ld (hl), b
+        pop af
+        ;jr _lseek_done
+
+_lseek_done:
+    pop af
+    ret po
+    ei
+    ret
+
+_lseek_einval:
+        ld hl, EINVAL
+        jr _
+_lseek_ebadf:
+        ld hl, EBADF
+        ;jr _
+_:
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Creates a new directory.
+; Parameters:
+;   (de) - The path of the directory to create.
+;   bc - The mode of the new directory.
+; Return:
+;   c flag - Set if the directory could not be created, reset if it was created.
+;   [hl - Inode of created directory]
+;
+mkdir: ; {{{
+    or a
+    ld a, i
+    push af
+        di
+
+        push bc
+            call resolve_path_dir
+        pop bc
+        jr c, _mkdir_error
+
+        ; Force the type part of the mode to a directory
+        ld a, b ; Type is in MSB
+        and ~S_IFMT >> 8 & $FF
+        or S_IFDIR >> 8
+        ld b, a
+
+        ; TODO Check if the filename exists (or do it in fs_create_direntry)
+        call fs_create_file
+        ; TODO Determine error (many possibilities)
+        jr c, _mkdir_error
+    pop af
+    ret po
+    ei
+    ret
+_mkdir_error:
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Creates a link to a file at a specified path with another path.
+; Parameters:
+;   (de) - The current path of the file.
+;   (hl) - The new path of the file.
+; Return:
+;   c flag - Set if the original file is invalid or the calling process does not
+;   have permission to it or the new path.
+;
+link: ; {{{
+    or a
+    ld a, i
+    push af
+        di
+
+        push hl
+            call resolve_path
+            ; hl = File inode
+        pop de ; (de) = New path
+
+        push hl
+            call resolve_path_dir
+            ; hl = New directory inode
+            ; (de) = Filename
+            ; TODO Check if the filename already exists
+        pop bc ; bc = File inode
+
+        ; TODO Should links to directories be allowed? It works fine in the
+        ; filesystem and is allowed by POSIX but not usually implemented in
+        ; Linux filesystems.
+
+        call fs_create_direntry
+        ; TODO Determine error (many possibilities)
+        jr c, _
+    pop af
+    ret po
+    ei
+    ret
+_:
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Removes a link to a file at a specified path.
+; This function also acts as rmdir. If the file is a directory, it will only be
+; removed if the directory is empty.
+; Parameters:
+;   (de) - The null-terminated path string.
+; Return:
+;   c flag - Set if the file does not exist or could not be removed or the file
+;   is a non-empty directory, reset if it was successfully removed.
+;
+unlink: ; {{{ \ remove:
+remove: ; This works for any file type
+    or a
+    ld a, i
+    push af
+        di
+
+        call resolve_path_dir
+        jr c, _unlink_error
+
+        push de
+        push hl
+            call resolve_path_at
+            jr c, _
+            call fs_get_mode
+            ld a, b
+            and S_IFMT >> 8
+            cp S_IFDIR >> 8
+            ; TODO Should this work for directories? It does with the
+            ; filesystem, but is usually disallowed in Linux.
+            jr z, _unlink_dir
+_unlink_reg:
+            or a
+            jr _
+_unlink_dir:
+            ; TODO Read mode and size into a buffer to avoid searching for the
+            ; file twice
+            call fs_get_size
+            ; TODO How to tell if the directory is empty? Have a special
+            ; function, not report the ".." empty in the size, check the size
+            ; against sizeof_dir_entrty istead of 0, etc. Checking against 0 is
+            ; wrong.
+            ld a, b
+            or c
+            jr z, _
+            scf
+_:
+        pop hl
+        pop de
+        jr c, _unlink_error
+
+        call fs_delete_direntry
+        ; TODO Determine error (many possibilities)
+        jr c, _unlink_error
+    pop af
+    ret po
+    ei
+    ret
+
+_unlink_error:
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Removes a directory.
+; Parameters:
+;   (de) - The path of the directory.
+; Return:
+;   c flag - Set if the directory does not exist or could not be removed or is
+;   non-empty, reset if it was successfully removed.
+;
+rmdir: ; {{{
+    or a
+    ld a, i
+    push af
+        di
+
+        call resolve_path_dir
+        ret c
+
+        push de
+        push hl
+            call resolve_path_at
+            jr c, _
+            call fs_get_mode
+            ld a, b
+            and S_IFMT >> 8
+            cp S_IFDIR >> 8
+            ; TODO Should this work for directories? It does with the
+            ; filesystem, but is usually disallowed in Linux.
+            jr nz, _rmdir_invalid
+
+            ; TODO Read mode and size into a buffer to avoid searching for the
+            ; file twice
+            call fs_get_size
+            ; TODO How to tell if the directory is empty? Have a special
+            ; function, not report the ".." entry in the size, check the size
+            ; against sizeof_fs_direntry istead of 0, etc.
+            ld hl, sizeof_fs_direntry
+            or a
+            sbc hl, bc
+            ; If the directory is non-empty, carry is set, so there is no need
+            ; to set it. If the directory is empty, carry is reset, so there is
+            ; no need to set it.
+            jr _
+_rmdir_invalid: ; Not an empty directory
+            scf
+_:
+        pop hl
+        pop de
+        jr c, _rmdir_error
+
+        call fs_delete_direntry
+        jr c, _rmdir_error
+    pop af
+    ret po
+    ei
+    ret
+
+_rmdir_error:
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Renames/moves a file.
+; Parameters:
+;   (de) - The current path of the file.
+;   (hl) - The new path of the file.
+; Return:
+;   c flag - Set if does not exist or could not be moved to the new location.
+;
+; TODO Make sure the names are not equal/equivalent? Right now, this doesn't
+; matter because the filesystem does not do many checks, so it will write
+; the redundant entry and then remove the old one.
+; TODO Make a filesystem function to do this to reduce the number of writes
+; (via inode file and nlink value updates).
+;
+rename: ; {{{
+    ; Disable interrupts to make the operation atomic
+    or a
+    ld a, i
+    push af
+        di
+
+        push de
+            call link
+        pop de
+        jr c, _rename_fail
+
+        call remove
+        jr c, _rename_fail
+
+    pop af
+    ret po
+    ei
+    ret
+
+_rename_fail:
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+

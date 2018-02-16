@@ -1,0 +1,757 @@
+;
+; malloc.z80
+;
+; Heap allocator/deallocator functions.
+;
+; malloc(), calloc(), realloc(), and free() allocate locally to the current
+; process. Other functions allocate globally for new process images. Both use
+; linked lists, each node being flagged as either used or empty.
+;
+; galloc() and gfree() are used to allocate and free program text and data
+; segments on the global scale and are for internal use only, when creating
+; processes. galloc_ref() increments the reference count on an existing global
+; allocation, a following call to gfree() will only free the allocation if there
+; is a single reference to it left. galloc_at() will attempt to make an
+; allocation at a specified offset in a page, and fall back to a normal
+; allocation if it is not possible.
+;
+
+#include "malloc.inc"
+
+
+;; Splits an allocation node.
+; The original (split) node will be set as used and the new node as empty.
+; Parameters:
+;   (iy) - Node to split.
+;   bc - Offset at which to split. This must be less than the node's size.
+; Return:
+;   (iy) - Original node (i.e. iy is preserved).
+; Preserves:
+;   ix, iy
+;
+alloc_split_: ; {{{
+    ; de = current_size
+    ld e, (iy + lalloc_node_size)
+    ld a, (iy + lalloc_node_size+1)
+    and ~ALLOC_NODE_EMPTY & $FF
+    ld d, a
+
+    ; (hl) = next = node + current_size
+    push iy \ pop hl
+    add hl, de
+
+    ; next->psize = child->size = current_size - new_size, empty
+    ; (de) = current_size - new_size, empty flag set
+    ex de, hl
+    or a
+    sbc hl, bc
+    ld a, h
+    or ALLOC_NODE_EMPTY
+    ld h, a
+    ex de, hl
+    ; lalloc_node_psize = 2
+    inc hl \ inc hl
+    ld (hl), e
+    inc hl
+    ld (hl), d
+
+    ; (hl) = child = node + new_size
+    push iy \ pop hl
+    add hl, bc
+
+    ; child->size = next->psize = de
+    ; lalloc_node_size = 0
+    ld (hl), e
+    inc hl
+    ld (hl), d
+
+    ; child->psize = new_size = bc
+    inc hl
+    ld (hl), c
+    inc hl
+    ld (hl), b
+
+    ; node->size = new_size
+    ld (iy + lalloc_node_size), c
+    ld (iy + lalloc_node_size+1), b
+
+    ret
+; }}}
+
+
+;; Merges an allocation node with its preceding node, if possible.
+; This will merge the nodes if the preceding node is empty. The state of the
+; passed node is irrelevent. If a merge is made, the new node will be set as
+; empty.
+; Parameters:
+;   (iy) - Node to merge.
+; Return:
+;   c flag - Reset on success, set on failure.
+;   (iy) - Merged node or original node, if a merge was not possible.
+;
+alloc_merge_left_: ; {{{
+    ; bc = node->psize
+    ; Check empty flag in the process
+    ld b, (iy + lalloc_node_psize+1)
+    ld a, b
+    and ~ALLOC_NODE_EMPTY & $FF
+    cp b
+    ; If the value is the same without the flag, flag was reset
+    scf
+    ret z
+
+    ld c, (iy + lalloc_node_psize)
+    ld b, a
+
+    ; de = node->size, assuming empty
+    ld e, (iy + lalloc_node_size)
+    ld a, (iy + lalloc_node_size+1)
+    and ~ALLOC_NODE_EMPTY & $FF
+    ld d, a
+
+    ; (hl) = next = node + node->size = iy + de
+    push iy \ pop hl
+    add hl, de
+
+    ; de = new_size = node->size + node->psize, empty flag set
+    ex de, hl
+    add hl, bc
+    ld a, h
+    or ALLOC_NODE_EMPTY
+    ld h, a
+    ex de, hl
+
+    ; next->psize = new_size = de, empty flag set
+    ; lalloc_node_psize = 2
+    inc hl \ inc hl
+    ld (hl), e
+    inc hl
+    ld (hl), d
+
+    ; (hl) = prev = node - node->psize = iy - bc
+    push iy \ pop hl
+    ;or a
+    sbc hl, bc
+
+    ; prev->size = new_size, empty flag set
+    ; lalloc_node_size = 0
+    ld (hl), e
+    inc hl
+    ld (hl), d
+
+    ret
+; }}}
+
+
+;; Merges an allocation node with its following node, if possible.
+; This will merge the nodes if the following node is empty. The state of the
+; passed node is irrelevent. If a merge is made, the new node will be set as
+; empty.
+; Parameters:
+;   (iy) - Node to merge.
+; Return:
+;   c flag - Reset on success, set on failure.
+;   (iy) - Merged node or original node, if a merge was not possible.
+;
+alloc_merge_right_: ; {{{
+    ; de = node->size
+    ld e, (iy + lalloc_node_size)
+    ld a, (iy + lalloc_node_size+1)
+    and ~ALLOC_NODE_EMPTY & $FF
+    ld d, a
+
+    ; (hl) = next = node + node->size = iy + de
+    push iy \ pop hl
+    add hl, de
+
+    ; Check if the next node is empty (and store the size if so)
+    ; bc = next->size
+    ; lalloc_node_size = 0
+    ld c, (hl)
+    inc hl
+    ld b, (hl)
+
+    ld a, b
+    and ~ALLOC_NODE_EMPTY & $FF
+    cp b
+    ; If the value is the same without the flag, flag was reset
+    scf
+    ret z
+
+    ld b, a ; MSB without the flag
+
+    ; node->size += next->size => de += bc
+    ex de, hl
+    add hl, bc
+    ex de, hl
+    ; Set empty flag to node->size
+    ld a, d
+    or ALLOC_NODE_EMPTY
+    ld d, a
+
+    ld (iy + lalloc_node_size), e
+    ld (iy + lalloc_node_size+1), d
+
+    ; nextnext = next + next->size = hl + bc
+    add hl, bc
+
+    ; nextnext->psize = node->size = de
+    ; lalloc_node_psize = 2
+    inc hl; \ inc hl ; (hl) was incremented 1 above
+    ld (hl), e
+    inc hl
+    ld (hl), d
+
+    ret
+; }}}
+
+
+;; Sets or resets the empty flag.
+; Parameters:
+;   (iy) - Node for which to set the flag.
+;   c flag - Desired state of the empty flag.
+;
+alloc_set_empty: ; {{{
+    ld e, (iy + lalloc_node_size)
+    ld a, (iy + lalloc_node_size+1)
+    jr c, _alloc_set_empty
+_alloc_reset_empty:
+    and ~ALLOC_NODE_EMPTY & $FF
+    jr _
+_alloc_set_empty:
+    or ALLOC_NODE_EMPTY
+_:
+    ld (iy + lalloc_node_size+1), a
+
+    ; Strip flag from d either way
+    ld h, a
+    and ~ALLOC_NODE_EMPTY & $FF
+    ld d, a
+    ld a, h
+
+    push iy \ pop hl
+    add hl, de
+    ; lalloc_node_psize = 2
+    inc hl \ inc hl
+    ; Only need to set MSB
+    inc hl
+    ld (hl), a
+
+    ret
+; }}}
+
+
+;; Allocates a block of memory for the current process.
+; Parameters:
+;   bc - Size of the block.
+; Return:
+;   c flag - Reset if there is a continuous block of memory available of the
+;       specified size, set if there is not.
+;   (hl) - Start of the memory block, if one was allocated. If the size is 0,
+;       this is set to a null pointer and the carry flag is reset to indicate
+;       success.
+; Preserves:
+;   ix
+;
+malloc: ; {{{
+    ; Check if bc = 0
+    ld a, b
+    or c ; resets carry
+    jr nz, _
+    ld hl, 0
+    ret
+_:
+
+    ; Size needed/stored includes the node/header
+    ; sizeof_lalloc_node = 4
+    inc bc \ inc bc \ inc bc; \ inc bc
+
+    ; Check if required size is larger than 1 page (more than 14-bit)
+    ;dec bc
+    scf
+    bit 7, b
+    ret nz
+    bit 6, b
+    ret nz
+
+    inc bc
+
+    ccf ; Reset carry
+    ld a, i
+    push af
+        di
+
+        ld iy, (cur_process)
+        ld l, (iy + proc_ent_heap_addr)
+        ld h, (iy + proc_ent_heap_addr+1)
+
+        push hl \ pop iy
+
+_malloc_loop:
+        ; Empty flag in MSB of size
+        ; lalloc_node_size = 0
+        ld e, (iy + lalloc_node_size)
+        ld d, (iy + lalloc_node_size+1)
+
+        ; Mask out and check flag
+        ld a, d
+        and ~ALLOC_NODE_EMPTY & $FF
+        cp d
+        ld d, a
+        jr z, _malloc_full ; a == d
+
+        ld h, d \ ld l, e
+        sbc hl, bc
+        jr z, _malloc_found_perfect
+        jr nc, _malloc_found
+
+_malloc_full:
+
+        ld a, d
+        or e
+        ; If the tail node was not usable, then none were
+        jr z, _malloc_fail
+
+        add iy, de
+
+        jr _malloc_loop
+
+_malloc_found:
+        call alloc_split_
+        jr _malloc_done
+
+_malloc_found_perfect:
+        ; Just write the size without the empty flag
+        ld (iy + lalloc_node_size+1), b
+        ;jr _malloc_done
+
+_malloc_done:
+        push iy \ pop hl
+
+        ; sizeof_lalloc_node = 4
+        inc hl \ inc hl \ inc hl \ inc hl
+    pop af
+    ret po
+    ei
+    ret
+
+_malloc_fail:
+        ld hl, ENOMEM
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Allocates a block of memory as an array and initializes it to 0.
+; Parameters:
+;   e - Size of each array element.
+;   bc - Number of elements.
+; Return:
+;   c flag - Reset if there is a continuous block of memory available of the
+;   specified size, set if there is not.
+;   (hl) - Start of the memory block, if one was allocated. If the size or
+;   number of elements is 0, this is a null pointer.
+; Preserves:
+;   ix
+;
+calloc: ; {{{
+    ld hl, 0
+
+    ld a, e
+    or a
+    jr nz, _
+    ret
+_:
+    ld a, b
+    or c
+    jr nz, _
+    ret
+_:
+
+    ; TODO Use faster multiplication algorithm
+_calloc_mul_loop:
+    add hl, bc
+    dec e
+    jr nz, _calloc_mul_loop
+
+    push bc
+        call malloc
+    pop bc
+    ret c
+    ; Since bc != 0, hl != 0 unless there was an error
+    ;ld a, h
+    ;or l
+    ;ret z
+
+    ld d, h \ ld e, l ; Preserve hl
+_calloc_fill_loop:
+    xor a
+    ld (de), a
+    inc de
+
+    dec bc
+    ld a, b
+    or c
+    jr nz, _calloc_fill_loop
+
+    ret
+; }}}
+
+
+;; Reallocates a block of memory.
+; Parameters:
+;   (hl) - Start of block to resize. This must have been returned from a
+;       previous call to malloc(), calloc(), or realloc() in this process or a
+;       null pointer (in the latter case, this is identical to malloc()). The
+;       behavior of this function is undefined (and almost certainly very
+;       detrimental) if this is not the case.
+;   bc - New size of the block.
+; Return:
+;   c flag - Reset if the reallocation was successful, set if it was not.
+;   (hl) - Start of the new block. This may or may not be the same as the
+;       original value. If the specified size was 0, this will be a null pointer
+;       (0).
+;
+realloc: ; {{{
+    ; If hl is null, same as malloc
+    ld a, h
+    or l
+    jp z, malloc
+
+    ; If bc is 0, same as free
+    ld a, b
+    or c
+    jp z, free
+
+    ; Carry is reset from or instruction
+    ld a, i
+    push af
+        di
+
+        ; To get things in a workable state quickly, this just malloc()s a new
+        ; node and free()s the old one, even if it could just grow/shrink the
+        ; current node.
+
+        push bc
+        push hl
+            call malloc
+            ex de, hl
+            ; (de) = new node
+        pop hl
+        pop bc
+        jr c, _realloc_fail
+
+        ; (hl) = old
+        ; (de) = new
+        ; bc = size TODO Copy old size, not new size
+        push de
+            push hl
+                ldir
+            pop hl
+            call free
+        pop hl
+
+    pop af
+    ret po
+    ei
+    ret
+
+; TODO Implement size checking to merge with adjacent blocks when possible
+;        ; Move to header
+;        ; sizeof_lalloc_node = 6
+;        dec hl \ dec hl \ dec hl \ dec hl \ dec hl \ dec hl
+;
+;        push hl \ pop iy
+;        ld l, (iy + lalloc_node_size)
+;        ld h, (iy + lalloc_node_size+1)
+;
+;        ;or a ; Carry is still reset from above
+;        sbc hl, bc
+;        jr z, _realloc_done ; Do nothing if they are the same
+;        jr c, _realloc_grow
+;
+;_realloc_shrink:
+;
+;_realloc_grow:
+;
+;_realloc_done:
+;        push iy \ pop hl
+;
+;        ; Move back to usable area
+;        ; sizeof_lalloc_node = 6
+;        inc hl \ inc hl \ inc hl \ inc hl \ inc hl \ inc hl
+;
+;    pop af
+;    ret po
+;    ei
+;    ret
+;
+_realloc_fail:
+        ld hl, ENOMEM
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Frees a block of memory.
+; Parameters:
+;   (hl) - Start of block to free. This must have been returned from a previous
+;       call to malloc(), calloc(), or realloc() in this process or a null pointer
+;       (in the latter case, no actionis taken). The behavior of this function
+;       is undefined (and almost certainly very detrimental) if this is not the
+;       case.
+;
+free: ; {{{
+    ld a, h
+    or l
+    ret z
+
+    ld a, i
+    push af
+        di
+
+        ; sizeof_lalloc_node = 4
+        dec hl \ dec hl \ dec hl \ dec hl
+
+        push hl \ pop iy
+
+        scf
+        call alloc_set_empty
+        call alloc_merge_right_
+        call alloc_merge_left_
+
+    pop af
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Allocate global memory block.
+; Currently, allocations cannot span pages.
+; Parameters:
+;   bc - Size of the block, in bytes.
+; Return:
+;   c flag - Reset if the alocation could be made, set if not.
+;   a - Page of the block.
+;   (hl) - Start of the block in bank A.
+;
+; TODO Find a good way to allow for allocations to span multiple pages without
+; storing 3-byte sizes or addresses, since doing so makes the offset and size
+; calculations much more difficult
+; TODO Do pages need to be restored after this?
+;
+galloc: ; {{{
+    ; Check if bc = 0
+    ld a, b
+    or c ; resets carry
+    jr nz, _
+    ld hl, 0
+    ret
+_:
+
+    ; Size needed/stored includes the node/header
+    ; sizeof_galloc_node = 5
+    inc bc \ inc bc \ inc bc \ inc bc; \ inc bc
+
+    ; Check if required size is larger than 1 page (more than 14-bit)
+    ;dec bc
+    scf
+    bit 7, b
+    ret nz
+    bit 6, b
+    ret nz
+    inc bc
+
+    ccf ; Reset carry
+    ld a, i
+    push af
+        di
+
+        ; Save the page
+        in a, (PORT_MEM_BANK_A)
+        push af
+
+            ld a, RAM_PAGE_START
+            out (PORT_MEM_BANK_A), a
+
+            ld iy, MEM_BANK_A_ADDR
+
+_galloc_loop:
+            ; Empty flag in MSB of size
+            ; galloc_node_size = 0
+            ld e, (iy + galloc_node_size)
+            ld d, (iy + galloc_node_size+1)
+
+            ; Mask out and check flag
+            ld a, d
+            and ~ALLOC_NODE_EMPTY & $FF
+            cp d
+            ld d, a
+            jr z, _galloc_full ; a == d
+
+            ld h, d \ ld l, e
+            or a
+            sbc hl, bc
+            jr z, _galloc_found_perfect
+            jr nc, _galloc_found
+
+_galloc_full:
+
+            ;ld a, d
+            or e
+            ; If the tail node was not usable, then none were, so go to the next
+            ; page if possible
+            jr nz, _galloc_next_node
+_galloc_next_page:
+            in a, (PORT_MEM_BANK_A) ; TODO Is pop af \ push af faster ?
+            cp RAM_PAGE_END
+            jr z, _galloc_fail
+            inc a
+            out (PORT_MEM_BANK_A), a
+            ld iy, MEM_BANK_A_ADDR
+            jr _galloc_loop
+
+_galloc_next_node:
+            add iy, de
+
+            jr _galloc_loop
+
+_galloc_found:
+            ; This function can be the same since allocations cannot span more
+            ; than 2 pages and the node's page and its following page are
+            ; currently mapped.
+            call alloc_split_
+            jr _galloc_done
+
+_galloc_found_perfect:
+            ; Just write the size without the empty flag and set the reference
+            ; counter
+            ld (iy + galloc_node_size+1), b
+            ;jr _galloc_done
+
+_galloc_done:
+            ld a, 1
+            ld (iy + galloc_node_refs), a
+            push iy \ pop hl
+
+            ; sizeof_galloc_node = 5
+            inc hl \ inc hl \ inc hl \ inc hl \ inc hl
+
+            in a, (PORT_MEM_BANK_A)
+            ld c, a ; Save
+        pop af
+        ; Restore page
+        out (PORT_MEM_BANK_A), a
+    pop af
+    ld a, c ; For return
+    ret po
+    ei
+    ret
+
+_galloc_fail:
+        pop af
+        ; Restore page
+        out (PORT_MEM_BANK_A), a
+
+        ld hl, ENOMEM
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Frees a global memory block.
+; Parameters:
+;   a - Page of the block.
+;   (hl) - Start of block to free. This must have been returned from a previous
+;       call to galloc().
+; TODO See if the node is already empty
+;
+gfree: ; {{{
+    cp RAM_PAGE_START
+    ret c ; page is too low
+
+    cp RAM_PAGE_END + 1
+    ret nc ; page is too high
+
+    ld c, a ; Save
+
+    ld a, h
+    or l
+    ret z
+
+    ld a, i
+    push af
+        di
+
+        in a, (PORT_MEM_BANK_A)
+        push af
+            ld a, c
+            out (PORT_MEM_BANK_A), a
+
+            ; galloc_node_refs = sizeof_galloc_node - 1
+            dec hl
+            ld a, (hl)
+            dec a
+            ld (hl), a
+            jr nz, _gfree_done
+
+            ; sizeof_galloc_node = 5, but hl = node - 1
+            dec hl \ dec hl \ dec hl \ dec hl
+
+            push hl \ pop iy
+
+            scf
+            call alloc_set_empty
+            call alloc_merge_right_
+            call alloc_merge_left_
+
+_gfree_done:
+        pop af
+        out (PORT_MEM_BANK_A), a
+
+    pop af
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Increments the reference count of a memory block.
+; Parameters:
+;   a - Page of the block
+;   (hl) - Start of the block. This must have been returned from a previous call
+;       to galloc().
+; Return:
+;   c flag - Set if there are too many references, reset otherwise.
+; Preserves:
+;   bc, de, ix, iy
+;
+galloc_ref: ; {{{
+    ; There is no need to make sure the node is non-empty, since the reference
+    ; count for empty nodes is never used.
+    out (PORT_MEM_BANK_A), a
+    dec hl
+    ld a, (hl)
+    inc a
+    jr z, _
+    ld (hl), a
+    or a
+    ret
+_:
+    scf
+    ret
+; }}}
+

@@ -1,0 +1,326 @@
+;
+; display.z80
+;
+; Functions for manipulating the LCD.
+;
+
+.nolist
+#include "display.inc"
+#include "ports.inc"
+.list
+
+;; Initializes the LCD.
+;
+lcd_init:
+    ld a, 3 + LCD_COM_SET_POWER
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, 3 + LCD_COM_SET_POW_ENHANCE
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, $2F + LCD_COM_SET_CONTRAST ; Medium contrast
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, LCD_COM_SET_ENABLE
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, LCD_COM_SET_Z_OFF + 0 ; Set z-address (RAM offset) to 0
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, LCD_COM_SET_ROW_INC
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, LCD_COM_SET_8_BIT
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, 0 + LCD_COM_SET_COL
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, 0 + LCD_COM_SET_ROW
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ; Clear text_screen_buf
+    ; TODO Put this somewhere else
+    ld hl, text_screen_buf
+    ld bc, LCD_WIDTH * LCD_HEIGHT / 8
+_:
+    ld (hl), 0
+    inc hl
+    dec bc
+    ld a, b
+    or c
+    jr nz, -_
+
+    ret
+
+
+;; Copies a buffer into the LCD.
+; The LCD is assumed to be in row-auto-increment and 8-bit mode.
+; TODO Change this? It would be more efficient/easier to do in column-increment
+; mode, since that is how data is stored in memory. It is probably not worth
+; switching, as there would be 2 extra delays, but the routine could split
+; depending on the current mode.
+;
+; Parameters:
+;   (hl) - The buffer.
+; Preserves:
+;   ix, iy
+;
+lcd_copy:
+    ld a, i
+    push af
+        di
+
+        ld a, 0 + LCD_COM_SET_ROW
+        rst rLCD_DELAY
+        out (PORT_LCD_COM), a
+
+        ld a, 0 + LCD_COM_SET_COL
+        ld c, a
+        ld de, LCD_WIDTH / 8
+_lcdcpy_col:
+        rst rLCD_DELAY
+        out (PORT_LCD_COM), a
+        ld b, LCD_HEIGHT
+_lcdcpy_row:
+        ld a, (hl)
+        rst rLCD_DELAY
+        out (PORT_LCD_DAT), a
+        add hl, de
+        djnz _lcdcpy_row
+        ; Move back to first row
+        dec h \ dec h \ dec h; hl -= 768
+        ; Move to next column
+        inc hl
+        inc c
+        ld a, c
+        cp $2C
+        jr nz, _lcdcpy_col
+    pop af
+    ret po
+    ei
+    ret
+
+
+;; Completely clears the LCD.
+; Row-increment mode is assumed, though the LCD may be in either 6-bit or 8-bit
+; transfer mode.
+; Preserves:
+;   hl, de, ix, iy
+;
+lcd_clear:
+    ld a, i
+    push af
+        di
+
+        ld c, PORT_LCD_COM
+        ld a, 0 + LCD_COM_SET_ROW
+_:
+        ; Equivalent to call lcd_wait. The sign flag is bit 7.
+        in f, (c)
+        jp m, -_
+        out (PORT_LCD_COM), a ; Same size but slightly faster than out (c), a
+        ld a, 0 + LCD_COM_SET_COL
+_lcdclr_col:
+        in f, (c)
+        jp m, _lcdclr_col
+        out (PORT_LCD_COM), a
+        push af
+            ld b, LCD_HEIGHT
+_lcdclr_row:
+            xor a
+_:
+            in f, (c)
+            jp m, -_
+            out (PORT_LCD_DAT), a
+            djnz -_
+        pop af
+        ; The flags are from the previous `in f, (c)`
+        ; Bit 6 (the z flag) is set in 8-bit mode.
+        ; Checking this every iteration is a bit inefficient, though it does not
+        ; matter much speed-wise as the LCD requires a delay anyway. The
+        ; alternative would be to create 2 routines, which would take up much
+        ; more space.
+        jr z, _lcdclr_8bit
+_lcdclr_6bit:
+        cp $2F
+        jr _lcdclr_inc
+_lcdclr_8bit:
+        cp $2B
+        ;jr _lcdclr_inc
+_lcdclr_inc:
+        jr z, _lcdclr_exit
+        inc a
+        jr _lcdclr_col
+
+_lcdclr_exit:
+    pop af
+    jp po, _
+    ei
+_:
+    ret
+
+
+;; Clears a range of rows in the lcd.
+;
+; TODO Should this (and other lcd functions) take into account the z-address
+; (and store that under the lcd_ namespace)?
+; Parameters:
+;   a - First row to clear.
+;   b - Number of rows to clear.
+; Preserves: TODO Also preserve de ?
+;   b, hl, ix, iy
+;
+lcd_clear_rows:
+    add a, LCD_COM_SET_ROW
+    ; d = row
+    ; e = column
+    ld d, a
+    ld e, LCD_COM_SET_COL + 0
+    ld c, PORT_LCD_COM
+
+    ld a, i
+    push af
+        di
+
+_lcdclrr_row:
+        in f, (c)
+        jp m, _lcdclrr_row
+        out (c), d
+
+_lcdclrr_col:
+        in f, (c)
+        jp m, _lcdclrr_col
+        out (c), e
+
+        push bc
+            xor a
+_:
+            in f, (c)
+            jp m, -_
+            out (PORT_LCD_DAT), a
+            djnz -_
+        pop bc
+
+        ; The flags are from the previous `in f, (c)`
+        ; Bit 6 (the z flag) is set in 8-bit mode.
+        ; Checking this every iteration is a bit inefficient, though it does not
+        ; matter much speed-wise as the LCD requires a delay anyway. The
+        ; alternative would be to create 2 routines, which would take up much
+        ; more space.
+        ld a, e
+        jr z, _lcdclrr_8bit
+_lcdclrr_6bit:
+        cp LCD_COM_SET_COL + $0F
+        jr _lcdclrr_inc
+_lcdclrr_8bit:
+        cp LCD_COM_SET_COL + $0B
+        ;jr _lcdclrr_inc
+
+_lcdclrr_inc:
+        jr z, _lcdclrr_return
+        inc e
+        jr _lcdclrr_row
+
+_lcdclrr_return:
+    pop af
+    ret po
+    ei
+    ret
+
+
+;; Reads data from the screen buffer down a column.
+; It is assumed that the LCD is in row-increment mode
+; Parameters:
+;   d - Row to start.
+;   e - Column to read from.
+;   (hl) - Buffer to read into.
+;   b - Number of rows from column d to read.
+; Preserves:
+;   c, ix, iy
+;
+; TODO Don't assume the driver is in row increment mode
+;
+lcd_read_col:
+    ld a, e
+    add a, LCD_COM_SET_COL
+    ; TODO Should this be used instead of
+    ;   in f, (c)
+    ;   jp m, ...
+    ; Like ION uses? It is slightly slower (has to pop af and return from the
+    ; function after the LCD is ready) but much smaller (1 vs 6 bytes)
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, d
+    add a, LCD_COM_SET_ROW
+    ld d, a
+    ; TODO Check bounds or wrap when incrementing below
+
+_lcdrc_loop:
+    ld a, d
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+    ; Dummy read after setting address
+    rst rLCD_DELAY ; TODO Is the delay needed here and/or between reads?
+    in a, (PORT_LCD_DAT) ; TODO Is a dummy read needed?
+    rst rLCD_DELAY
+    in a, (PORT_LCD_DAT)
+    ld (hl), a
+
+    inc hl
+    inc d
+    djnz _lcdrc_loop
+
+    ret
+
+
+;; Writes data to the screen down a column.
+; This is used as a byte-aligned sprite routine.
+; It is assumed that the LCD is in row-increment mode
+; Parameters:
+;   d - Row to start.
+;   e - Column to write to.
+;   (hl) - Buffer to read from.
+;   b - Number of rows to write.
+; Preserves:
+;   c, e, ix, iy
+;
+; TODO Don't assume driver's state.
+;
+lcd_write_col:
+
+    ld a, e
+    add a, LCD_COM_SET_COL
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), A
+
+    ld a, d
+    add a, LCD_COM_SET_ROW
+    ld d, a
+    ; TODO Check bounds or wrap below
+
+_lcdwc_loop:
+    ld a, d
+    rst rLCD_DELAY
+    out (PORT_LCD_COM), a
+
+    ld a, (hl)
+    rst rLCD_DELAY
+    out (PORT_LCD_DAT), a
+
+    inc hl
+    inc d
+    djnz _lcdwc_loop
+
+    ret
+

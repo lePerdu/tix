@@ -1,0 +1,54 @@
+;
+; page_priv.z80
+;
+; Functions which need to be on a privileged page to work.
+;
+; These should not be called directly, but through the addresses specified in
+; priv.inc (with this page mapped to bank A, as specified in priv.inc).
+;
+
+.nolist
+#include "flash.inc"
+#include "ports.inc"
+#include "priv.inc"
+.list
+
+.org priv_unlock_flash
+    jp unlock_flash
+.org priv_lock_flash
+    jp lock_flash
+
+
+unlock_flash:
+    ld a, i
+    push af
+        di
+        ld a, 1
+        nop
+        nop
+        im 1
+        di
+        out (PORT_FLASH_CTL), a
+    pop af
+    ret po
+    ei
+    ret
+
+
+lock_flash:
+    ld a, i
+    push af
+        di
+        xor a
+        nop
+        nop
+        im 1
+        di
+        out (PORT_FLASH_CTL), a
+    pop af
+    ret po
+    ei
+    ret
+
+FLASH_PAGE_END(MEM_BANK_A_ADDR, priv_page)
+

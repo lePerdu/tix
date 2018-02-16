@@ -1,0 +1,436 @@
+;
+; graphics.z80
+;
+
+#include "display.inc"
+
+;; Gets the location of a pixel in a screen buffer.
+; Parameters:
+;   (hl) - Screen buffer.
+;   d - Column.
+;   e - Row.
+; Return:
+;   (hl) - Byte of the pixel.
+;   a - Bitmask of the pixel in the byte (e.g. %00100000 for the 3rd pixel in
+;       the byte).
+;   b - Bit number (from the MSB). This corresponds to the bitmask in
+;       a, e.g. 0 -> %10000000 and 5 -> %00000100.
+; Preserves:
+;   ix, iy
+;
+gr_get_pixel: ; {{{
+    ex de, hl
+    ld a, h ; Column
+    ld h, 0
+    ; ld l, l ; Row
+    ; 12 bytes per row
+    ld b, h \ ld c, l
+    add hl, hl
+    add hl, bc
+    add hl, hl
+    add hl, hl
+    add hl, de ; Add offset to buffer
+
+    ld c, a ; Column
+    ; 8 pixels per byte
+    srl c \ srl c \ srl c
+    ; ld b, 0
+    add hl, bc
+
+    ; col % 8 is the bit number from the left
+    and 7
+    ld b, a
+    ld c, b ; Save b
+    inc b ; If b = 0, djnz won't work right, so shift a and inc b
+    ld a, %00000001
+_:
+    rrca
+    djnz -_
+    ld b, c
+    ret
+; }}}
+
+
+;; Clears a range of rows in a screen buffer.
+; Parameters:
+;   (hl) - Screen buffer to clear in.
+;   a - First row to clear.
+;   b - Number of rows to clear.
+; Preserves:
+;   ix, iy
+gr_clear_rows: ; {{{
+    ex de, hl
+    ld h, 0
+    ld l, a
+    ; offset = row * LCD_WIDTH / 8 = row * 12
+    add hl, hl
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    add hl, hl
+    add hl, hl
+    add hl, de
+
+    ld c, b ; Use b for the inner loop
+_grcr_loop:
+    xor a
+    ld b, LCD_WIDTH / 8
+_:
+    ld (hl), a
+    inc hl
+    djnz -_
+    dec c
+    jr nz, _grcr_loop
+    ret
+; }}}
+
+
+;; Draws an 8-bit sprite to a screen buffer using OR logic (turns pixels on).
+; Parameters:
+;   (hl) - Screen buffer.
+;   (iy) - Sprite.
+;   d - Column.
+;   e - Row.
+;   b - Height.
+;
+gr_put_sprite_or: ; {{{
+    call gr_clip_sprite_
+    ret c
+
+    ld c, a ; Clip mask
+    push bc
+        call gr_get_pixel
+    pop de ; Free now
+    ; b = shift count
+    ; d = height
+    ; e = clip mask
+
+    cp %10000000
+    jr z, _grpso_aligned
+
+    ; When not aligned, some bits are in the next byte
+_grpso_non_anligned:
+    push bc
+        ld a, (iy)
+        and e
+
+        ; Shift bits into c
+        ld c, 0
+_:
+        srl a
+        rr c
+        djnz -_
+
+        or (hl)
+        ld (hl), a
+        ld a, c
+        inc hl
+        or (hl)
+        ld (hl), a
+
+        inc iy
+        ld a, LCD_WIDTH / 8 - 1 ; hl was inc'd 1 above
+        add a, l
+        ld l, a
+        jr nc, _
+        inc h
+_:
+    pop bc
+    dec d
+    jr nz, _grpso_non_anligned
+    ret
+
+_grpso_aligned:
+    ld a, (iy)
+    and e
+    or (hl)
+    ld (hl), a
+
+    inc iy
+    ld a, LCD_WIDTH / 8
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+
+    dec d
+    jr nz, _grpso_aligned
+    ret
+
+; }}}
+
+
+;; Draws an 8-bit sprite to a screen buffer using OR logic (turns pixels off).
+; Parameters:
+;   (hl) - Screen buffer.
+;   (iy) - Sprite.
+;   d - Column.
+;   e - Row.
+;   b - Height.
+;
+gr_put_sprite_and: ; {{{
+    call gr_clip_sprite_
+    ret c
+
+    ; The clip mask is complemented and OR'd with source bytes to set clipped
+    ; byte to 1
+    cpl
+    ld c, a ; Clip mask
+
+    push bc
+        call gr_get_pixel
+    pop de ; Free now
+    ; b = shift count
+    ; d = height
+    ; e = clip mask
+
+    cp %10000000
+    jr z, _grpsa_aligned
+
+    ; When not aligned, some bits are in the next byte
+_grpsa_non_anligned:
+    push bc
+        ld a, (iy)
+        or e
+
+        ; Shift bits into c
+        ld c, %11111111
+        ; Set carry to shift 1's into a (rr c sets it in subsequent itations)
+        scf
+_:
+        rr a
+        rr c
+        djnz -_
+
+        and (hl)
+        ld (hl), a
+        ld a, c
+        inc hl
+        and (hl)
+        ld (hl), a
+
+        inc iy
+        ld a, LCD_WIDTH / 8 - 1 ; hl was inc'd 1 above
+        add a, l
+        ld l, a
+        jr nc, _
+        inc h
+_:
+    pop bc
+    dec d
+    jr nz, _grpsa_non_anligned
+    ret
+
+_grpsa_aligned:
+    ld a, (iy)
+    or e
+    and (hl)
+    ld (hl), a
+
+    inc iy
+    ld a, LCD_WIDTH / 8
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+
+    dec d
+    jr nz, _grpsa_aligned
+    ret
+
+; }}}
+
+
+;; Draws an 8-bit sprite to a screen buffer using OR logic (inverts pixels).
+; Parameters:
+;   (hl) - Screen buffer.
+;   (iy) - Sprite.
+;   d - Column.
+;   e - Row.
+;   b - Height.
+;
+gr_put_sprite_xor: ; {{{
+    call gr_clip_sprite_
+    ret c
+    ld c, a ; Clip mask
+
+    push bc
+        call gr_get_pixel
+    pop de ; Free now
+    ; b = shift count
+    ; d = height
+    ; e = clip mask
+
+    cp %10000000
+    jr z, _grpsx_aligned
+
+    ; When not aligned, some bits are in the next byte
+_grpsx_non_anligned:
+    push bc
+        ld a, (iy)
+        and e
+
+        ; Shift bits into c
+        ld c, 0
+_:
+        srl a
+        rr c
+        djnz -_
+
+        xor (hl)
+        ld (hl), a
+        ld a, c
+        inc hl
+        xor (hl)
+        ld (hl), a
+
+        inc iy
+        ld a, LCD_WIDTH / 8 - 1 ; hl was inc'd 1 above
+        add a, l
+        ld l, a
+        jr nc, _
+        inc h
+_:
+    pop bc
+    dec d
+    jr nz, _grpsx_non_anligned
+    ret
+
+_grpsx_aligned:
+    ld a, (iy)
+    and e
+    xor (hl)
+    ld (hl), a
+
+    inc iy
+    ld a, LCD_WIDTH / 8
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+
+    dec d
+    jr nz, _grpsx_aligned
+    ret
+
+; }}}
+
+
+;; Determines the clipping mask for a sprite to prevent is from being drawn off
+;; the edge of the screen.
+; The returned mask should be AND'ed with sprite values for use with OR logic:
+; clipped bits are set to 0.
+; Parameters:
+;   (iy) - Sprite.
+;   d - Column.
+;   e - Row.
+;   b - Height.
+; Return:
+;   c flag - Set if the sprite is completely off the screen, in which case the
+;       rest of the returns are irrelevant.
+;   (iy) - Adjusted sprite (if clipped on the top).
+;   d - Column. This is unchanged because the byte does not change if bits are
+;       clipped.
+;   e - Adjusted row (if clipped on the top).
+;   a - Mask for the sprite.
+;   b - Clipped height of the sprite. If the sprite is not on the screen at all,
+;       this is 0 and other values may not be correct.
+;
+; Preserves:
+;   hl, ix
+;
+gr_clip_sprite_: ; {{{
+_grcs_vert:
+    ld a, e
+    or a
+    jp m, _grcs_top
+
+_grcs_bottom:
+    ; a = row - screen_height
+    sub LCD_HEIGHT
+    jr c, _
+    ; Off the screen
+    scf
+    ret
+_:
+
+    ; See if screen_height - col - height > 0
+    neg
+    cp b
+    jr nc, _grcs_horiz
+
+    ; screen_height - col is the remaining height
+    ld b, a
+    jr _grcs_horiz
+
+_grcs_top:
+    ; a = row - height
+    ld a, b
+    neg
+    sub e
+    jr c, _
+    scf
+    ret
+_:
+
+    push af
+        ; a = -row = number of rows to cliip
+        add a, b
+        ld b, 0
+        ld c, a
+        ld e, b ; Start row = 0
+        add iy, bc
+    pop af
+    neg
+    ld b, a ; new height = height - row
+
+
+_grcs_horiz:
+    ld a, d
+    cp -7
+    ; -7 <= col < 0
+    jr nc, _grcs_left
+    cp LCD_WIDTH
+    ; col >= width (or col < -7)
+    jr c, _
+    scf
+    ret
+_:
+    cp LCD_WIDTH - 7
+    jr nc, _grcs_right
+    ; col < width-7, so it is fully on screen
+    ld a, %11111111
+    or a
+    ret
+
+_grcs_right:
+    and 7 ; Number of bits to mask out (non-zero because of the checks above)
+    ld c, a
+    ld a, %11111111
+_:
+    ;sla a
+    add a, a
+    dec c
+    jr nz, -_
+
+    or a
+    ret
+
+_grcs_left:
+    and 7 ; Number of bits to mask out (non-zero because of the checks above)
+    ld c, a
+    ld a, %11111111
+_:
+    srl a
+    dec c
+    jr nz, -_
+
+    or a
+    ret
+; }}}
+

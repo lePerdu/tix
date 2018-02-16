@@ -1,0 +1,593 @@
+;
+; strinig.z80
+;
+; String functions.
+;
+; This is copied from src/string.z80 for use with userspace programs.
+;
+
+#include "errno.inc"
+
+;; Finds the length of a string.
+; Parameters:
+;   (hl) - String.
+; Return:
+;   bc - Length of the string.
+; Preserves:
+;   de, hl, ix, iy
+;
+strlen: ; {{{
+    ld bc, 0
+    xor a
+    cpir
+    ; Technically, we should check if bc = 0 (from overflow), but that is
+    ; impossible because there is at least 1 0 in the addres space from ld bc,
+    ; 0.
+
+    add hl, bc ; Reset hl
+
+    ; Negate and decrement bc
+    ld a, b
+    cpl
+    ld b, a
+    ld a, c
+    cpl
+    ld c, a
+    ; inc bc
+    ; dec bc
+    ret
+; }}}
+
+
+;; Finds the length of a string, but cap the search length.
+; Parameters:
+;   (hl) - String.
+;   bc - Maximum length to return.
+; Return:
+;   bc - Length of the string, or the original value if no null byte is found
+;       within the specified length.
+; Preserves:
+;   hl, ix, iy
+;
+strnlen: ; {{{
+    ld a, b
+    or c
+    ret z
+    ld d, b \ ld e, c
+    xor a
+    cpir
+    jr z, _ ; Found the null byte
+    ; Restore hl
+    sbc hl, de
+    ld b, d \ ld c, e ; Get the initial length
+    ret
+_:
+    ; If bc != 0, bc = original - (length + 1)
+    ex de, hl
+    ; or a
+    ; Subtract from initial length
+    sbc hl, bc
+    ld b, h \ ld c, l
+    ex de, hl
+    ; Restore hl
+    or a
+    sbc hl, bc
+    dec bc
+    ret
+; }}}
+
+
+;; Copy a string.
+; Parameters:
+;   (hl) - String to copy.
+;   (de) - Location to copy to.
+; Return:
+;   (de) - Preserved.
+; Preserves:
+;   de, hl, ix, iy
+;
+strcpy: ; {{{
+    lcall strlen
+    inc bc ; Also copy null
+    ; Copy from the end to preserve the original pointers
+    add hl, bc
+    ex de, hl
+    add hl, bc
+    ex de, hl
+    lddr
+    inc hl \ inc de
+    ret
+; }}}
+
+
+;; Copy a string, returning a pointer to the end of it.
+; Parameters:
+;   (hl) - String to copy.
+;   (de) - Location to copy to.
+; Return:
+;   (de) - End of the new string (at the null byte).
+; Preserves:
+;   hl, ix, iy
+;
+stpcpy: ; {{{
+    lcall strlen
+    inc bc ; Also copy null
+    push hl
+        ldir
+        dec de
+    pop hl
+    ret
+; }}}
+
+
+;; Copy a fixed-length string.
+; If the original string is shorter than the number of characters, the new
+; string will be padded with null bytes. If the original string is longer than
+; the number of characters, only the first portion of the string will be copied
+; and no null byte will be added.
+; Parameters:
+;   (hl) - String to copy.
+;   (de) - Location to copy to.
+;   bc - Number of characters to copy.
+; Return:
+;   (de) - Preserved.
+; Preserves:
+;   de, ix, iy
+;
+strncpy: ; {{{
+    push de
+        xor a
+_:
+        cp (hl)
+        jr z, _strncpy_pad
+        ldi
+        ljp pe, -_
+        ; Written maximum number of characters
+    pop de
+    ret
+
+_strncpy_pad:
+        ex de, hl ; ld (de), 0 is not an instruction
+_:
+        ld (hl), 0
+        inc hl
+        dec bc
+        ld a, b
+        or c
+        jr nz, -_
+
+        ex de, hl
+    pop de
+    ret
+; }}}
+
+
+;; Copy a fixed-length string, returning a pointer to the end of it.
+; If the original string is shorter than the number of characters, the new
+; string will be padded with null bytes. If the original string is longer than
+; the number of characters, only the first portion of the string will be copied
+; and no null byte will be added.
+; Parameters:
+;   (hl) - String to copy.
+;   (de) - Location to copy to.
+;   bc - Number of characters to copy.
+; Return:
+;   (de) - The first null byte of the new string, or the last byte copied, if no
+;       null bytes were.
+; Preserves:
+;   ix, iy
+;
+stpncpy: ; {{{
+    xor a
+_:
+    cp (hl)
+    jr z, _stpncpy_pad
+    ldi
+    ljp pe, -_
+    dec de ; ldi leaves it past the last byte
+    ret
+
+_stpncpy_pad:
+    ex de, hl ; ld (de), 0 is not an instruction (also preserve return value)
+_:
+    ld (hl), 0
+    inc hl
+    dec bc
+    ld a, b
+    or c
+    jr nz, -_
+
+    ret
+; }}}
+
+
+;; Compares two strings
+; Parameters:
+;   (hl) - First string.
+;   (de) - Second string.
+; Return:
+;   a - Positive, negative, or 0 to indicate that the first string is greater
+;       than, less than, or equal to the second.
+;   z flag - Set if the strings are equal, reset if not.
+; Preserves:
+;   de, hl, ix, iy
+;
+strcmp: ; {{{
+    ld bc, 0 ; Keep track of sizes to restore de and hl
+_strcmp_loop:
+    ld a, (de)
+    cp (hl)
+    jr nz, _strcmp_ne
+    or a
+    jr z, _strcmp_eq
+
+    inc de
+    inc hl
+    inc bc
+    jr _strcmp_loop
+
+_strcmp_ne:
+    sub (hl)
+    ; z is not set since we only jump here if the strings are not equal.
+
+_strcmp_eq:
+    ; Restore strings
+    or a
+    sbc hl, bc
+
+    ex de, hl
+    or a
+    sbc hl, bc
+    ex de, hl
+
+    or a
+    ret
+
+; }}}
+
+; Localesa are not currently supported
+strcoll .equ strcmp
+
+
+;; Compares the first portions of two strings.
+; Parameters:
+;   (hl) - First string.
+;   (de) - Second string.
+;   bc - Number of characters to compare.
+; Return:
+;   a - Positive, negative, or 0 to indicate that the first string is greater
+;       than, less than, or equal to the second.
+;   z flag - Set if the strings are equal, reset if not.
+; Preserves:
+;   ix, iy
+;
+strncmp: ; {{{
+    ld a, b
+    or c
+    ret z
+
+_strncmp_loop:
+    ld a, (de)
+    cp (hl)
+    jr nz, _strncmp_ne
+    or a
+    ret z
+    inc de
+    inc hl
+    dec bc
+    ld a, b
+    or c
+    ret z
+    jr nz, _strncmp_loop
+
+_strncmp_ne:
+    sub (hl)
+    ret
+    ; z is not set since we only jump here if the strings are not equal.
+
+; }}}
+
+
+;; Finds the first occurance of a character in a string.
+; Parameters:
+;   (hl) - String.
+;   a - Character to search for.
+; Return:
+;   c flag - Reset if the character was found, set if not.
+;   (de) - Occurance in the string at (hl) with the character in a.
+; Preserves:
+;   a, b, hl, ix, iy
+;
+strchr: ; {{{
+    ; TODO Is it faster to use strlen and then cpir?
+    ld d, h \ ld e, l
+    ld c, a
+_:
+    ld a, (de)
+    cp c
+    ret z ; a = c, so it is preserved
+    or a
+    jr z, _
+    inc de
+    jr -_
+_:
+    ld a, c ; Preserve a
+    scf
+    ret
+; }}}
+
+
+;; Finds the last occurance of a character in a string.
+; Parameters:
+;   (hl) - String.
+;   a - Character to search for.
+; Return:
+;   c flag - Reset if the character was found, set if not.
+;   (de) - Occurance in the string at (hl) with the character in a.
+; Preserves:
+;   a, hl, ix, iy
+;
+strrchr: ; {{{
+    ld e, a ; Save character
+    xor a
+    ld bc, 0
+    cpir
+    dec hl
+
+    ; TODO Is it faster to use a loop and not negate bc?
+    ; Negate and decrement bc
+    ld a, b
+    cpl
+    ld b, a
+    ld a, c
+    cpl
+    ld c, a
+    ; inc bc
+    ; dec bc
+
+    ld a, e
+    cpdr
+    jr nz, _ ; Not found
+    ld d, h \ ld e, l
+    inc de
+    ;or a
+    sbc hl, bc ; Restore hl
+    ;or a
+    ret
+
+_:
+    ;or a
+    sbc hl, bc
+    scf
+    ret
+; }}}
+
+
+;; Finds the first occurance of a character in a string.
+; Parameters:
+;   (hl) - String to search in.
+;   (de) - String to search for.
+; Return:
+;   c flag - Reset if the string was found, set if not.
+;   (hl) - Occurance of (de) in the original (hl) string. TODO Return this in
+;       bc, ix, or iy?
+; Preserves:
+;   de, ix, iy
+;
+strstr: ; {{{
+    ; Get length of the search string for strncmp()
+    ex de, hl
+    lcall strlen
+    ex de, hl
+    ld a, b
+    or c
+    ret z
+
+_strstr_loop:
+    ld a, (hl)
+    or a
+    jr z, _ ; End of string
+
+    push bc
+    push de
+    push hl
+        lcall strncmp
+    pop hl
+    pop de
+    pop bc
+    ret z
+
+    inc hl
+    jr _strstr_loop
+
+_:
+    scf
+    ret
+; }}}
+
+
+;; Duplicate a string into dynamic memory.
+; Parameters:
+;   (hl) - String to duplicate.
+; Return:
+;   c flag - Reset if memory could be allocated, set if not.
+;   (hl) - Duplicated string. This should be free()'d after use.
+; Preserves:
+;   ix
+;
+; TODO Return in de and restore hl?
+strdup: ; {{{
+    lcall strlen
+    inc bc ; Also allocate null byte
+    push hl
+        push bc
+            syscall malloc_
+        pop bc
+        jr c, _
+        ex (sp), hl
+        ex de, hl
+        ; (de) = (sp) = allocation
+        ; (hl) = string
+        ; bc = length
+        ldir
+    pop hl
+    or a
+    ret
+
+_:
+    pop hl
+    scf
+    ret
+; }}}
+
+
+;; Duplicate a string into dynamic memory, but cap the length.
+; If the string is longer than the maximum number of characters, only part of it
+; will be copied, although a null byte will still be added to the new string.
+; Parameters:
+;   (hl) - String to duplicate.
+;   bc - Maximum length of the string to duplicate.
+; Return:
+;   c flag - Reset if memory could be allocated, set if not.
+;   (hl) - Duplicated string. This should be free()'d after use.
+; Preserves:
+;   ix
+;
+; TODO Return in de and restore hl?
+strndup: ; {{{
+    lcall strnlen
+    inc bc ; Allocate null byte
+
+    push hl ; string
+        push bc
+            syscall malloc_
+        pop bc
+        jr c, _
+        ld d, h \ ld e, l
+        ex (sp), hl
+        dec bc ; Copy the null byte separately
+        ; (de) = (sp) = allocation
+        ; (hl) = string
+        ; bc = length
+        ldir
+
+        ; In case the full string was not copied, add a null byte
+        xor a
+        ld (de), a
+    pop hl
+    ;or a
+    ret
+
+_:
+        ld hl, ENOMEM
+        ; lcall proc_set_errno
+    pop hl
+    scf
+    ret
+; }}}
+
+
+;; Get the number of characters at the start of a string which consist only of
+;; a set of characters.
+; Parameters:
+;   (hl) - String to search.
+;   (de) - String containing the character set.
+; Return:
+;   bc - Number of characters at the start of (hl) which consist only of
+;   characters in (de).
+; Preserves:
+;   de, ix, iy
+;
+strspn: ; {{{
+    ld bc, 0
+
+_:
+    ld a, (hl)
+    or a
+    ret z
+    push bc
+    push de
+        ex (sp), hl
+        ; (hl) = character set
+        ; (sp) = string to search
+        lcall strchr
+        ex de, hl
+    pop hl
+    pop bc
+    ret c
+
+    inc hl
+    inc bc
+    jr -_
+
+; }}}
+
+
+;; Get the number of characters at the start of a string which are not in a set
+;; of characters.
+; Parameters:
+;   (hl) - String to search.
+;   (de) - String containing the character set.
+; Return:
+;   bc - Number of characters at the start of (hl) which consist only of
+;   characters not in (de).
+; Preserves:
+;   de, ix, iy
+;
+strcspn: ; {{{
+    ld bc, 0
+
+_:
+    ld a, (hl)
+    or a
+    ret z
+    push bc
+    push de
+        ex (sp), hl
+        ; (hl) = character set
+        ; (sp) = string to search
+        lcall strchr
+        ex de, hl
+    pop hl
+    pop bc
+    ret nc
+
+    inc hl
+    inc bc
+    jr -_
+
+; }}}
+
+
+;; Get the first character in a string from a character set.
+; Parameters:
+;   (hl) - String to search.
+;   (de) - String containing the character set.
+; Return:
+;   c flag - Reset if a character is found, set if not.
+;   (hl) - First character in the original string which is in (de).
+; Preserves:
+;   de, ix, iy
+;
+strpbrk: ; {{{
+    ld a, (hl)
+    or a
+    jr nz, _
+    ; None found
+    scf
+    ret
+_:
+    push de
+        ex (sp), hl
+        ; (hl) = character set
+        ; (sp) = string to search
+        lcall strchr
+        ex de, hl
+    pop hl
+    ret nc
+
+    inc hl
+    jr strpbrk
+
+; }}}
+

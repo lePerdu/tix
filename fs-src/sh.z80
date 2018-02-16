@@ -1,0 +1,431 @@
+;
+; sh.z80
+;
+
+.nolist
+#include "tix.inc"
+#include "stat.inc"
+#include "unistd.inc"
+#include "utils.inc"
+.list
+
+T_EOL .equ 0
+T_WORD .equ 1
+
+.org $0000
+.db "TIXE"
+.dw $100
+.dw $40
+.dw text
+.dw text_end - text
+.dw data
+.dw data_end - data
+
+text:
+tixe_sec_start("text")
+
+    ; This is a primative shell that executes programs.
+
+read_cmd:
+    lld iy, prompt_str
+    ld bc, prompt_str_len
+    ld a, STDOUT_FILENO
+    syscall write_
+    ljp c, error
+
+    lld iy, cmd_buf
+    ld bc, CMD_BUF_SIZE-1
+    ld a, STDIN_FILENO
+    syscall read_
+    ljp c, error
+
+    ; Exit if nothing is read (at end of file)
+    ld a, b
+    or c
+    ljp z, shell_exit
+
+    ; Append null byte
+    add iy, bc
+    ld (iy), 0
+
+    xor a
+    lld (parse_state), a
+    lld ix, args
+
+    lld iy, cmd_buf
+parse_cmdline:
+    lcall lex
+    cp T_WORD
+    jr nz, read_cmd ; Just read the next line
+
+    push iy
+        lcall strndup
+    pop iy
+    ljp c, error
+    ld (ix),  l
+    inc ix
+    ld (ix), h
+    inc ix
+    lcall parse_arg_redir
+    ljp exec_cmd
+
+parse_arg_redir:
+    lcall lex
+    cp T_WORD
+    jr z, parse_arg
+    cp '>'
+    jr z, parse_redir_out
+    cp '<'
+    jr z, parse_redir_in
+    cp T_EOL
+    ret z
+    ljp error
+
+    ; (hl) = string
+    ; bc = length
+parse_arg:
+    push iy
+        lcall strndup
+    pop iy
+    ljp c, error
+    ld (ix), l
+    inc ix
+    ld (ix), h
+    inc ix
+    ljp parse_arg_redir
+
+parse_redir_out:
+    lcall lex
+    cp T_WORD
+    ljp nz, error
+
+    ; Save the current stdout if not already saved
+    lld a, (stdout_save)
+    cp $FF
+    jr nz, _
+    ld a, STDOUT_FILENO
+    ld de, F_DUPFD_CLOEXEC
+    push bc
+    push hl
+        syscall fcntl_
+        ld a, l
+    pop hl
+    pop bc
+    ljp c, error
+    lld (stdout_save), a
+_:
+    push bc
+    push hl
+        ld a, STDOUT_FILENO
+        syscall close_
+    pop hl
+    pop bc
+
+    ; Temporarily write a null byte to terminate the filename for open()
+    ld d, h \ ld e, l
+    add hl, bc
+    ld b, (hl)
+    ld (hl), 0
+    push bc
+    push hl
+    push ix
+    push iy
+        ld hl, O_WRONLY | O_TRUNC | O_CREAT
+        ; Create mode in case the file does not exist
+        ld bc, S_IFREG | S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH
+        syscall open_
+    pop iy
+    pop ix
+    pop hl
+    pop bc
+    ljp c, error
+    ld (hl), b ; Restore byte
+
+    ljp parse_arg_redir
+
+parse_redir_in:
+    lcall lex
+    cp T_WORD
+    ljp nz, error
+
+    ; Save the current stdout if not already saved
+    lld a, (stdin_save)
+    cp $FF
+    jr nz, _
+    ld a, STDIN_FILENO
+    ld de, F_DUPFD_CLOEXEC
+    push bc
+    push hl
+        syscall fcntl_
+        ld a, l
+    pop hl
+    pop bc
+    ljp c, error
+    lld (stdin_save), a
+_:
+    push bc
+    push hl
+        ld a, STDIN_FILENO
+        syscall close_
+    pop hl
+    pop bc
+
+    ; Temporarily write a null byte to terminate the filename for open()
+    ld d, h \ ld e, l
+    add hl, bc
+    ld b, (hl)
+    ld (hl), 0
+    push bc
+    push hl
+    push ix
+    push iy
+        ld hl, O_RDONLY
+        syscall open_
+    pop iy
+    pop ix
+    pop hl
+    pop bc
+    ljp c, error
+    ld (hl), b ; Restore byte
+
+    ljp parse_arg_redir
+
+exec_cmd:
+    ; Terminate the argument list
+    ld (ix), 0
+    ld (ix+1), 0
+
+    ; Check for shell built-ins
+    ; TODO Should this be done at an earlier stage?
+    lld ix, args
+    ld l, (ix)
+    inc ix
+    ld h, (ix)
+    inc ix
+
+    lld de, cd_str
+    lcall strcmp
+    jr nz, _
+    lcall shell_cd
+    ljp read_cmd
+_:
+    lld de, exit_str
+    lcall strcmp
+    jr nz, _
+    ljp shell_exit
+_:
+
+    syscall vfork_
+    or a
+    jr z, child_fork
+parent_fork:
+    ; Restore file descriptors
+    ; TODO Do this in a generic way to allow for file descriptors other than
+    ; stdout and stdin to be redirected
+    lld a, (stdout_save)
+    cp $FF
+    jr z, _
+    ld c, STDOUT_FILENO
+    syscall dup2_
+    ljp c, error
+    lld a, (stdout_save)
+    syscall close_
+    ld a, $FF
+    lld (stdout_save), a
+_:
+    lld a, (stdin_save)
+    cp $FF
+    jr z, _
+    ld c, STDIN_FILENO
+    syscall dup2_
+    ljp c, error
+    lld a, (stdin_save)
+    syscall close_
+    ld a, $FF
+    lld (stdin_save), a
+_:
+
+    ; Free arguments
+    lld ix, args
+_:
+    ld l, (ix)
+    inc ix
+    ld h, (ix)
+    ld a, h
+    or l
+    jr z, _
+    inc ix
+    syscall free_
+    jr -_
+_:
+
+    syscall wait_
+    ljp c, error
+    ljp read_cmd
+
+child_fork:
+    lld hl, args
+    ld a, (hl)
+    ld ixl, a
+    inc hl
+    ld a, (hl)
+    ld ixh, a
+    inc hl
+    syscall execv_
+
+    ld hl, 1
+    syscall exit_
+
+error:
+    lld iy, error_str
+    ld bc, error_str_len
+    ld a, STDERR_FILENO
+    syscall write_
+
+    jr $
+
+
+lex: ; {{{
+    ; Skip over whitespace at the start to avoid dealing with empty words
+    dec iy
+_:
+    inc iy
+    ld a, (iy)
+    cp ' '
+    jr z, -_
+    cp '\t'
+    jr z, -_
+    cp '\n'
+    jr z, -_
+    or a
+    ret z ; Return T_EOL
+
+    push iy \ pop bc
+_lex_loop:
+    ld a, (iy)
+    inc iy
+    or a
+    jr z, _lex_delim_null
+    cp ' '
+    jr z, _lex_delim
+    cp '\t'
+    jr z, _lex_delim
+    cp '\n'
+    jr z, _lex_delim
+
+    cp '<'
+    ret z
+    cp '>'
+    ret z
+
+    jr _lex_loop
+
+_lex_delim_null:
+    dec iy ; So that T_EOL will be returned on the next call
+_lex_delim:
+    ld d, b \ ld e, c ; Start of the word
+    push iy \ pop hl
+    or a
+    sbc hl, bc
+    ld b, h \ ld c, l
+    dec bc ; Don't include the delimiter
+    ex de, hl
+    ld a, T_WORD
+    ret
+; }}}
+
+
+;; Shell built-in cd command
+; Parameters:
+;   (ix) - Argument list.
+;
+shell_cd: ; {{{
+    ld e, (ix)
+    ld d, (ix+1)
+    ld a, d
+    or e
+    jr z, _cd_home
+    jr _cd_chdir
+
+_cd_home:
+    lld de, home_var_str
+    syscall getenv_
+    ret c
+
+    ex de, hl
+_cd_chdir:
+    syscall chdir_
+    ret
+; }}}
+
+
+;; Exits a shell
+;
+shell_exit: ; {{{
+    ld hl, 0
+    syscall exit_
+; }}}
+
+#include "test/string.z80"
+
+tixe_sec_end()
+text_end:
+
+data:
+tixe_sec_start("data")
+
+parse_state:
+    .db 0
+DEFINE_OR_MASK(PS_DQUOT, 0)
+DEFINE_OR_MASK(PS_SQUOT, 1)
+DEFINE_OR_MASK(PS_REDIR_OUT, 2)
+DEFINE_OR_MASK(PS_APPEND, 3)
+DEFINE_OR_MASK(PS_REDIR_IN, 4)
+
+stdin_save:
+    .db $FF
+stdout_save:
+    .db $FF
+stderr_save:
+    .db $FF
+
+whitespace_str:
+    .db " \t\n",0
+
+prompt_str:
+    .db "$ ",0
+prompt_str_len .equ $ - prompt_str
+
+not_found_str:
+    .db "Cmd not found.\n",0
+not_found_str_len .equ $ - not_found_str
+
+error_str:
+    .db "\nError\n",0
+error_str_len .equ $ - error_str
+
+home_var_str:
+    .db "HOME",0
+
+cd_str:
+    .db "cd",0
+
+exit_str:
+    .db "exit",0
+
+args:
+    .fill 20
+
+CMD_BUF_SIZE .equ 255
+cmd_buf:
+    .fill CMD_BUF_SIZE
+
+; TODO Dynamically allocate/grow this
+ARG_BUF_SIZE .equ 64
+arg_buf:
+    .fill ARG_BUF_SIZE
+arg_buf_end:
+
+tixe_sec_end()
+data_end:
+

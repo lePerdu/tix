@@ -1,0 +1,1701 @@
+;
+; process.z80
+;
+; Functions for handling processes.
+;
+
+#include "filesystem.inc"
+#include "malloc.inc"
+#include "memmap.inc"
+#include "process.inc"
+
+;; Dummy process entry data to initialize the first process.
+proc_pid1_ent: ; {{{
+    ; Flags
+    .db PROC_USED
+    ; Real, effective, and saved UID and GID
+    ; TODO What values should be used?
+    .db 0, 0, 0, 0, 0, 0
+    ; Parent
+    .db 0
+    ; status
+    .dw 0
+    ; cwd ("/")
+    .dw FS_ROOT
+    ; text_page, text_addr = 0 so gfree() does nothing
+    .db 0
+    .dw $0000
+    ; data_page, data_addr = 0 so gfree() does nothing
+    .db 0 ; Page 0 has pid1's initial data (argument and environment lists)
+    .dw $0000
+    ; heap_addr
+    .dw $0000
+    ; os_data_addr
+    .dw $0000
+    ; context
+    .fill proc_ent_ctx_end - proc_ent_ctx, 0
+    ; sp
+    .dw $0000
+    ; return address
+    .dw $0000
+    ; fildes
+    .fill OPEN_MAX, $FF
+    ; children
+    .fill CHILD_MAX, 0
+; }}}
+
+
+;; Empty argument list for the init process
+proc_pid1_argv: ; {{{
+    .dw 0 ; Null pointer (no arguments)
+; }}}
+
+;; Initial environment for the init process
+; Pointers are relocated to bank C because that is where proc_arg_copy_() and
+; related functions expect them to be.
+proc_pid1_environ: ; {{{
+relocate($ + MEM_BANK_C_ADDR)
+    .dw _pp1e_home
+    .dw _pp1e_path
+    .dw 0
+
+_pp1e_home:
+    .db "HOME=/home",0
+_pp1e_path:
+    .db "PATH=/:/bin",0
+endrelocate()
+; }}}
+
+
+;; Initializes all process table entries to be blank.
+; TODO Also initialize the first process, PID 1 ?
+;
+proc_init_all: ; {{{
+    ld hl, proc_table
+    ld de, sizeof_proc_ent
+    ld b, PROC_MAX
+    xor a
+_:
+    ; Set flags to 0
+    ; proc_ent_flags = 0
+    ld (hl), a
+    add hl, de
+    djnz -_
+    ret
+; }}}
+
+
+;; Gets the address of errno for the current process.
+; Return:
+;   (hl) - Errno variable.
+; Preserves:
+;   bc, de, ix, iy
+;
+proc_get_errno: ; {{{
+    ld hl, (cur_process)
+    ld a, proc_ent_prog_data_addr
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    ; errno = -2
+    dec hl \ dec hl
+    ret
+; }}}
+
+
+;; Gets the environ array.
+; Return:
+;   (hl) - Start of environ array.
+; Preserves:
+;   bc, de, ix, iy
+;
+; proc_get_environ:
+;     ld hl, (cur_process)
+;     ld a, proc_ent_prog_data_addr
+;     add a, l
+;     ld l, a
+;     jr nc, _
+;     inc h
+; _:
+;     ld a, (hl)
+;     inc hl
+;     ld h, (hl)
+;     ld l, a
+;     ; environ = -4
+;     dec hl \ dec hl \ dec hl; \ dec hl
+;     ld a, (hl)
+;     dec hl
+;     ld l, (hl)
+;     ld h, a
+;     ret
+
+;; Sets the errno value for the current process.
+; Parameters:
+;   hl - The new errno value.
+; Return:
+;   c flag - Set (because pretty much everything that sets errno also set
+;       carry to indicate the error).
+; Preserves:
+;   bc, hl, ix, iy
+;
+proc_set_errno: ; {{{
+    ex de, hl
+    call proc_get_errno
+
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    ex de, hl
+    scf
+    ret
+; }}}
+
+
+;; Gets the address of a process table entry.
+; Parameters:
+;   a - PID of the process.
+; Return:
+;   c flag - Set if the PID is invalid (out of range), reset otherwise.
+;   (hl) - Table entry.
+; Preserves:
+;   de, ix, iy
+;
+proc_deref_: ; {{{
+    ; PIDs are indexed from 1
+    dec a
+    cp PROC_MAX
+    ; Error if a >= PROC_MAX
+    ccf
+    ret c
+
+    ; TODO Use multiplicaiton routine, although PIDs are relatively small, so it
+    ; may not have any speed-up.
+    ld hl, proc_table
+    ld bc, sizeof_proc_ent
+    or a
+    jr z, ++_ ; Check condition first then use a do...while loop
+_:
+    add hl, bc
+    dec a
+    jr nz, -_
+_:
+
+    ret
+; }}}
+
+
+;; Finds the next open process table entry.
+; Return:
+;   c flag - Reset if there is an available process entry; est if not.
+;   (hl) - Open process entry.
+;   a - PID associated with the entry at (hl).
+; Preserves:
+;   c, ix, iy
+;
+proc_get_open_: ; {{{
+    ld hl, proc_table
+    ld de, sizeof_proc_ent
+    ld b, PROC_MAX
+
+_:
+    ld a, (hl)
+    bit BIT_PROC_USED, a
+    jr z, _
+    add hl, de
+    djnz -_
+
+    ; If no open processes
+    scf
+    ret
+
+_:
+    ld a, PROC_MAX + 1 ; Processes are indexed from 1
+    sub b
+    ; carry is reset since b is always <= PROC_MAX
+    ret
+; }}}
+
+
+;; Saves the context of the current process.
+; This should be called as a function, as it returns to its caller, though it
+; should be called from the initial stack level of the function, as it saves the
+; calling function's return address (so don't try to save registers by pushing
+; them before calling this).
+; Kernel RAM is mapped and interrupts are disabled.
+;
+; Preserves:
+;   bc, ix
+;
+proc_ctx_save_: ; {{{
+    di
+    push iy
+    push hl
+        push af ; Add operations modify flags
+            KERNEL_RAM_MAP()
+            ld iy, (cur_process)
+            ld hl, 10
+            add hl, sp
+            ld (iy + proc_ent_ctx_sp), l
+            ld (iy + proc_ent_ctx_sp+1), h
+
+            ex de, hl
+            ld de, proc_ent_ctx_end
+            add iy, de
+            ex de, hl
+        pop af
+    pop hl
+
+    ld sp, iy
+
+    push af
+    push bc
+    push de
+    push hl
+    push ix
+    push hl ; Space for iy
+
+    ; For now, only pages A and C are significant.
+    in a, (PORT_MEM_BANK_A)
+    ld l, a
+    in a, (PORT_MEM_BANK_C)
+    ld h, a
+    push hl
+
+    ld iy, (cur_process)
+    ld l, (iy + proc_ent_ctx_sp)
+    ld h, (iy + proc_ent_ctx_sp+1)
+    dec hl \ dec hl \ dec hl \ dec hl \ dec hl \ dec hl
+    ld sp, hl
+    pop hl
+    ld (iy + proc_ent_ctx_iy), l
+    ld (iy + proc_ent_ctx_iy+1), h
+    pop de ; Caller of this function
+    pop hl ; Pre-context-save return address
+    push hl
+    push de
+    ld (iy + proc_ent_ctx_ret), l
+    ld (iy + proc_ent_ctx_ret+1), h
+    ret
+; }}}
+
+
+;; Restores the context of a the current process.
+; This should be jumped to, not called, as it returns to the stored return
+; address for the process, not the calling address.
+; Kernel RAM is unmapped and interrupts are enabled.
+;
+proc_ctx_restore_: ; {{{
+    ; KERNEL_RAM_MAP() ; This is always called from kernel code anyway
+    ld iy, (cur_process)
+    ld l, (iy + proc_ent_ctx_sp)
+    ld h, (iy + proc_ent_ctx_sp+1)
+    ld sp, hl
+
+    ld e, (iy + proc_ent_ctx_ret)
+    ld d, (iy + proc_ent_ctx_ret+1)
+    push de
+
+    ld e, (iy + proc_ent_ctx_hl)
+    ld d, (iy + proc_ent_ctx_hl+1)
+    push de
+
+    ld de, proc_ent_ctx
+    add iy, de
+    ld sp, iy
+
+    pop de
+    ld a, d
+    out (PORT_MEM_BANK_C), a
+    ld a, e
+    out (PORT_MEM_BANK_A), a
+
+    ; Do this before pop af to preserve flags
+    dec hl \ dec hl \ dec hl \ dec hl
+
+    pop iy
+    pop ix
+    pop de ; Space for hl
+    pop de
+    pop bc
+    pop af
+
+    ld sp, hl
+
+    ld h, a
+    KERNEL_RAM_UNMAP()
+    ld a, h
+
+    pop hl
+    ei
+    ret
+
+; }}}
+
+
+;; Gets the next active process.
+; An active process is one that is not waiting, terminated, sleeping, or the
+; parent of a vfork()'ed process.
+;
+; Return:
+;   a - PID of the active process.
+;   (hl) - Process table entry of the process
+;
+proc_get_next_active_: ; {{{
+    ld hl, (cur_process)
+    ld de, sizeof_proc_ent
+    ld a, (cur_pid)
+    ld c, a
+_proc_get_active_loop:
+    add hl, de
+    ld a, c
+    inc a
+    cp PROC_MAX+1
+    jr nz, _
+    ld a, 1
+    ld hl, proc_table
+_:
+    ld c, a
+
+    ld a, (hl)
+    bit BIT_PROC_USED, a
+    jr z, _proc_get_active_loop
+
+    and PROC_WAITING | PROC_TERMINATED | PROC_VFORK_PARENT | PROC_SLEEPING
+    jr nz, _proc_get_active_loop
+
+    ; TODO Set cur_pid and cur_process ?
+    ld a, c
+    ret
+; }}}
+
+
+;; Switches execution to the next running process.
+;
+proc_ctx_switch: ; {{{
+    call proc_ctx_save_
+    call proc_get_next_active_
+    ld (cur_pid), a
+    ld (cur_process), hl
+    jp proc_ctx_restore_
+; }}}
+
+
+;; Locations in kernel_tmp to store various things during process creation
+; Kernel RAM must be mapped to use these.
+proc_create_sp_save     .equ kernel_tmp + 0
+; Page of arguments and environment (both in program data)
+proc_create_arg_page    .equ kernel_tmp + 2
+proc_create_envp        .equ kernel_tmp + 3
+proc_create_envp_size   .equ kernel_tmp + 5
+proc_create_envp_count  .equ kernel_tmp + 7
+proc_create_argv        .equ kernel_tmp + 9
+proc_create_argv_size   .equ kernel_tmp + 11 ; Total size of arguments
+proc_create_argc        .equ kernel_tmp + 13 ; Number of arguments
+proc_create_tixe_header .equ kernel_tmp + 17
+proc_create_tmp_stack   .equ kernel_tmp_end
+
+
+;; Calculate the total size of the environment or argument list, including its
+;; elements.
+; Parameters:
+;   (hl) - Start of array (in bank C).
+; Return:
+;   bc - Total size of array.
+;   de - Number of elements in the array.
+; Preserves:
+;   ix, iy
+;
+proc_get_arg_size_: ; {{{
+    ld a, (proc_create_arg_page)
+    out (PORT_MEM_BANK_A), a
+    ; Relocate to bank A
+    res 7, h
+
+    ld bc, 0
+    ld de, 0
+    push de
+_proc_get_env_size_loop:
+        inc bc \ inc bc ; Pointer
+        ld e, (hl)
+        inc hl
+        ld d, (hl)
+        inc hl
+        ld a, d
+        or e
+        jr z, _
+        ex de, hl
+        push bc
+            res 7, h
+            call strlen
+            inc bc ; Include null
+        pop hl ; Previous size
+        add hl, bc
+        ld b, h \ ld c, l
+        ex de, hl
+    pop de
+    inc de
+    push de
+        jr _proc_get_env_size_loop
+
+_:
+    pop de
+    ret
+; }}}
+
+
+;; Deep-copies an argument or environment list.
+; There must be sufficient room in the destination to store the data.
+; Parameters:
+;   (hl) - List (in bank C).
+;   (de) - Location to copy to.
+; TODO Relocate strings
+proc_arg_copy_: ; {{{
+    ld a, (proc_create_arg_page)
+    out (PORT_MEM_BANK_A), a
+    res 7, h
+
+    ; Reserve space for the array of pointers
+    push de
+    push hl
+_proc_arg_copy_alloc_array:
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+        inc hl
+        inc de \ inc de
+        ld a, b
+        or c
+        jr z, _
+
+        jr _proc_arg_copy_alloc_array
+_:
+        ; Strings can now be copied to (de)
+    pop hl
+    pop bc ; Destination array
+
+    ; Copy elements
+    ; (hl) = Source array
+    ; (de) = Location to copy strings
+    ; (sp) = Destination array
+    ;
+    ; To avoid using ix and iy, some minor stack hacks are used.
+    push bc ; Dest array element
+_proc_arg_copy_elem:
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+        inc hl
+
+        ld a, b
+        or c
+        jr z, _proc_arg_copy_null
+
+        ; hl = Dest array element
+        ; (sp) = Next source array element
+        ex (sp), hl
+        ; Address of this string is the top of destination data
+        ld (hl), e
+        inc hl
+        ld (hl), d
+        inc hl
+        ex (sp), hl
+        ; hl = Next source array element
+        ; (sp) = Next dest array element
+        ; (de) = Top of data section
+
+        push hl
+            ; (hl) = String to copy
+            ld h, b \ ld l, c
+            res 7, h
+            call stpcpy ; (de) = End of the copy
+            inc de
+        pop hl
+        ; (de) = New top of data section
+
+    jr _proc_arg_copy_elem
+
+_proc_arg_copy_null:
+    pop bc ; Dest array element
+    xor a
+    ld (bc), a
+    inc bc
+    ld (bc), a
+    ret
+; }}}
+
+
+;; Allocates the text section of a process.
+; Parameters:
+;   (ix) - TIXE header.
+; Returns:
+;   c flag - Reset on success, set on failure.
+;   a - Page of allocation.
+;   hl - Address of allocation, in bank A.
+; Preserves:
+;   ix
+;
+proc_alloc_text_: ; {{{
+    ld c, (ix + tixeh_text_size)
+    ld b, (ix + tixeh_text_size+1)
+    ; galloc() returns address in bank A, which is correct for the text section
+    jp galloc
+; }}}
+
+
+;; Allocates the data section of a process.
+; Parameters:
+;   (ix) - TIXE header.
+; Returns:
+;   c flag - Reset on success, set on failure.
+;   a - Page of allocation.
+;   hl - Address of allocation, in bank C.
+; Preserves:
+;   ix
+;
+proc_alloc_data_: ; {{{
+    ; data =
+    ;   program data
+    ;   heap
+    ;   stack
+    ;   os data
+    ;   arguments
+    ;   environment
+    ld l, (ix + tixeh_data_size)
+    ld h, (ix + tixeh_data_size+1)
+
+    ; TODO Implement default values for heap and stack sizes
+    ld c, (ix + tixeh_heap_size)
+    ld b, (ix + tixeh_heap_size+1)
+    add hl, bc
+
+    ld c, (ix + tixeh_stack_size)
+    ld b, (ix + tixeh_stack_size+1)
+    add hl, bc
+
+    ; TODO Increase requested heap and stack sizes to account for memory used by
+    ; system routines.
+
+    ; TODO Get sizes of env and argv arrays
+    ld bc, sizeof_proc_os_data
+    add hl, bc
+
+    ld bc, (proc_create_argv_size)
+    add hl, bc
+    ld bc, (proc_create_envp_size)
+    add hl, bc
+
+    ld b, h \ ld c, l
+    call galloc
+    ret c
+
+    ld bc, MEM_BANK_C_ADDR - MEM_BANK_A_ADDR
+    add hl, bc
+    or a ; TODO Remove?
+    ret
+; }}}
+
+
+;; Reads code from a file into the text section of a process.
+; The stack must be in kernel_tmp since this remaps bank C.
+; No privilege checking is done on the file, so this must be done prior to
+; calling.
+; Parameters:
+;   hl - Inode of the file.
+;   (ix) - TIXE headher. This should be from the file with inode in hl, read
+;       into a buffer for convenience.
+;   (iy) - Process table entry.
+; Return:
+;   c flag - Set if there was an error reading the file.
+; Preserves:
+;   ix, iy
+;
+proc_init_text_: ; {{{
+    ; The text section is mapped to bank C so that the filesystem can use bank A
+    ; to read from.
+    ld a, (iy + proc_ent_text_page)
+    out (PORT_MEM_BANK_C), a
+
+    ; (de) = text section in bank C
+    ex de, hl
+    ld l, (iy + proc_ent_text_addr)
+    ld h, (iy + proc_ent_text_addr+1)
+    ; Relocate to bank C
+    ld bc, MEM_BANK_C_ADDR - MEM_BANK_A_ADDR
+    add hl, bc
+    ex de, hl
+
+    push de ; Read destination
+        ex (sp), iy ; iy = read destination, stack = process entry
+        ; de = Text offset in file
+        ; bc = Text size in file
+        ld e, (ix + tixeh_text_off)
+        ld d, (ix + tixeh_text_off+1)
+        ld c, (ix + tixeh_text_size)
+        ld b, (ix + tixeh_text_size+1)
+        call fs_read_file
+    pop iy ; Process entry
+    ; TODO Verify that the number of bytes read was the number listed in the
+    ; header
+
+    ret ; c flag set if set by fs_read_file
+; }}}
+
+
+;; Initializes data section of a process.
+; The stack must be in kernel_tmp since this remaps bank C.
+; No privilege checking is done on the file, so this must be done prior to
+; calling.
+; Parameters:
+;   hl - Inode of the file.
+;   (ix) - TIXE headher. This should be from the file with inode in hl, read
+;       into a buffer for convenience.
+;   (iy) - Process table entry.
+; Return:
+;   c flag - Set if there was an error reading the file.
+; Preserves:
+;   ix, iy
+;
+proc_init_data_: ; {{{
+    ; Copy program data
+
+    ld a, (iy + proc_ent_data_page)
+    out (PORT_MEM_BANK_C), a
+
+    ; The data section layout is:
+    ;   arguments
+    ;   environment
+    ;   OS data
+    ;   program data
+    ;   heap
+    ;   stack
+    ;
+    ; Initialization is done in a weird order:
+    ;   program data - because hl is occupied with the inode right now
+    ;   heap - because the program data size is needed to know where it starts
+    ;   arguments
+    ;   environment
+    ;   OS data
+    ;   stack - Last because it requires knowing where the arguments are
+    ;
+
+    ; (de) = program data section in bank C (already relocated there)
+    ex de, hl
+    ld l, (iy + proc_ent_data_addr)
+    ld h, (iy + proc_ent_data_addr+1)
+    ld bc, (proc_create_envp_size)
+    add hl, bc
+    ld bc, (proc_create_argv_size)
+    add hl, bc
+    ld bc, sizeof_proc_os_data
+    add hl, bc
+    ex de, hl
+
+    ld (iy + proc_ent_prog_data_addr), e
+    ld (iy + proc_ent_prog_data_addr+1), d
+
+    push de ; Read destination
+        ex (sp), iy ; iy = read destination, stack = process entry
+        ; de = Text offset in file
+        ; bc = Text size in file
+        ld e, (ix + tixeh_data_off)
+        ld d, (ix + tixeh_data_off+1)
+        ld c, (ix + tixeh_data_size)
+        ld b, (ix + tixeh_data_size+1)
+        call fs_read_file
+    pop iy ; Process entry
+    ; TODO Verify that the number of bytes read was the number listed in the
+    ; header
+    ret c
+
+    ; Initialize heap
+    ; (data page is already mapped)
+    ld l, (iy + proc_ent_prog_data_addr)
+    ld h, (iy + proc_ent_prog_data_addr+1)
+    add hl, bc ; bc = Number of bytes read above
+
+    ld (iy + proc_ent_heap_addr), l
+    ld (iy + proc_ent_heap_addr+1), h
+
+    ld c, (ix + tixeh_heap_size)
+    ld b, (ix + tixeh_heap_size+1)
+    ; bc -= sizeof_lalloc_node = 4
+    dec bc \ dec bc \ dec bc \ dec bc
+
+    ; Head node
+    ; Size with empty flag set
+    ; lalloc_node_size = 0
+    ld (hl), c
+    inc hl
+    ld a, b
+    or ALLOC_NODE_EMPTY
+    ld (hl), a
+    ; Previous size = 0
+    xor a
+    inc hl
+    ld (hl), a
+    inc hl
+    ld (hl), a
+
+    ; Goto end of heap
+    ; (hl) = start of tail node
+    dec hl \ dec hl \ dec hl ; Start of head
+    add hl, bc
+    ; Size = 0
+    xor a
+    ld (hl), a
+    inc hl
+    ld (hl), a
+    ; Previous size with empty flag set
+    inc hl
+    ld (hl), c
+    inc hl
+    ld a, b
+    or ALLOC_NODE_EMPTY
+    ld (hl), a
+
+    ; Store the new stack location in the stack pointer (fitting, huh), but
+    ; don't initialize the stack until after the arguments are copied.
+    ; (hl) = bottom of stack
+    ld c, (ix + tixeh_stack_size)
+    ld b, (ix + tixeh_stack_size+1)
+    add hl, bc
+    ld (proc_create_sp_save), sp
+    ld sp, hl
+
+    ; Copy environment and arguments
+
+    ld e, (iy + proc_ent_data_addr)
+    ld d, (iy + proc_ent_data_addr+1)
+
+    ld hl, (proc_create_argv)
+    call proc_arg_copy_
+
+    push de
+        ld hl, (proc_create_envp)
+        call proc_arg_copy_
+    pop hl
+    ex de, hl
+    ; (de) = environment
+    ; (hl) = new top of data section
+
+    ; proc_os_data_environ = 0
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    inc hl
+
+    ; proc_os_data_errno = 2
+    xor a
+    ld (hl), a
+    inc hl
+    ld (hl), a
+    inc hl
+
+    ; Allocate the environment array (but not the strings themselves) on the
+    ; heap.
+    ; TODO Don't write the array to static data above just to copy it later.
+    ld bc, (proc_create_envp_count)
+    inc bc ; Also need the null-terminator
+    sla c \ rl b
+    push bc
+    push de
+    push iy
+        call malloc
+    pop iy
+    pop de
+    pop bc
+    ret c
+    ex de, hl
+    push de
+        ldir
+    pop de ; new environ
+
+    ; TODO Write this to environ in the first place
+    ld l, (iy + proc_ent_prog_data_addr)
+    ld h, (iy + proc_ent_prog_data_addr+1)
+    ; environ = -4
+    dec hl \ dec hl \ dec hl; \ dec hl
+    ld (hl), d
+    dec hl
+    ld (hl), e
+
+    ; Initialize stack with arguments, return address, mapping state, and
+    ; placeholder values for registers to work with proc_ctx_restore_()
+
+    ; argv is at the start of the data section
+    ld l, (iy + proc_ent_data_addr)
+    ld h, (iy + proc_ent_data_addr+1)
+    push hl
+
+    ; argc
+    ld hl, (proc_create_argc)
+    push hl
+
+    ; Return address from main() = exit() (with some extra code to map kernel
+    ; RAM)
+    ld hl, proc_exit_ret_cb_
+    push hl
+
+    ; This is the top of the stack for the process
+    ld hl, 0
+    add hl, sp
+    ld (iy + proc_ent_ctx_sp), l
+    ld (iy + proc_ent_ctx_sp+1), h
+
+    ; Starting address
+    ld a, (iy + proc_ent_text_addr)
+    ld (iy + proc_ent_ctx_ret), a
+    ld a, (iy + proc_ent_text_addr+1)
+    ld (iy + proc_ent_ctx_ret+1), a
+
+    ; Set page mappings (only A and C matter and are stored for now)
+    ld a, (iy + proc_ent_text_page)
+    ld (iy + proc_ent_ctx_page_a), a
+    ld a, (iy + proc_ent_data_page)
+    ld (iy + proc_ent_ctx_page_c), a
+
+    ; The rest of the context (registers) do not matter, so there is no reason
+    ; to save them
+
+    ; Put back stack
+    ld sp, (proc_create_sp_save)
+    ret
+; }}}
+
+
+;; Remove the VFORK flags from this process and its parent, if it is set.
+; Paramters:
+;   (iy) - Process entry
+;
+proc_vfork_release_: ; {{{
+    ; If this process was created from vfork(), the parent can be released now.
+    ld a, (iy + proc_ent_flags)
+    bit BIT_PROC_VFORKED, a
+    ret z ; Not set
+
+_execve_vfork:
+    ; Rmove from this process
+    and ~PROC_VFORKED & $FF
+    ld (iy + proc_ent_flags), a
+    ; Remove from parent
+    ld a, (iy + proc_ent_parent)
+    call proc_deref_
+    ;jr c, _ ; If no parent ; The process was forked, so it must have a parent.
+    ; proc_ent_flags = 0
+    ld a, (hl)
+    and ~PROC_VFORK_PARENT & $FF
+    ld (hl), a
+    ret
+; }}}
+
+
+;; Initializes the first process, PID 1, with dummy data to work until the first
+;; exec*() call.
+;
+proc_init_pid1: ; {{{
+    ; This uses dummy data to initialize the process entry and then calls
+    ; proc_exec() like normal.
+    ; TODO Clear all entries here?
+    ld de, proc_table ; First entry
+    ld hl, proc_pid1_ent
+    ld bc, sizeof_proc_ent
+    ldir
+
+    ; Set current process
+    ld a, 1
+    ld (cur_pid), a
+    ld de, proc_table ; TODO Push the value above
+    ld (cur_process), de
+
+    ret
+; }}}
+
+
+;; Execute a program in PID 1, using default argument and environment lists.
+; Parameters:
+;   (ix) - Executable file path.
+; Return:
+;   Only returns if an error occurs.
+;
+proc_exec_pid1: ; {{{
+    ; Relocate to bank C because that's what everything expects
+    ld hl, proc_pid1_argv + MEM_BANK_C_ADDR
+    ld de, proc_pid1_environ + MEM_BANK_C_ADDR
+
+    jp execve
+; }}}
+
+
+;; Execute a new program in the current process with argument and environment
+;; arrays.
+; Parameters:
+;   (ix) - Executable file path.
+;   (hl) - Array of arguments.
+;   (de) - Environment array.
+; Return:
+;   Only returns if an error occurs.
+;
+execve: ; {{{
+    ld a, i
+    push af
+        di
+
+        ; Since we free the current data section below, the stack has to be
+        ; moved to kernel_tmp. (It is done here so that _execve_fail can restore
+        ; the stack when jumping from other locations)
+        ld (proc_create_sp_save), sp
+        ld sp, proc_create_tmp_stack
+
+        ; TODO Change register usage (pass arguments and environment in ix and
+        ; iy)
+        push hl
+            push de
+                push ix \ pop de
+                push de
+                    call resolve_path
+                pop de
+                jr nc, _execve_found_file
+
+                ; Search for the file in PATH if the filename does not include a
+                ; slash
+                ex de, hl
+                ld a, '/'
+                call strchr
+                ; No slash
+                jp nc, _execve_enoent
+
+                ld de, _execve_path_str
+                call getenv
+                jp c, _execve_enoent
+
+_execve_path_search:
+                ; Interrupts are disabled, so we can modify the string
+                ; temporarily and replace the ':'s with nulls.
+                ld a, ':'
+                call strchr
+                ; Set hl to 0 if there are no more segments
+                ; Set the colon to 0 to terminate the current segment for
+                ; searching it
+                jr c, _
+                xor a
+                ld (de), a
+_:
+                push af ; Carry set if no more paths
+                push de ; End of current segment
+                    ex de, hl ; de = start of current segment
+                    call resolve_path
+                    jr c, _
+                    push ix \ pop de
+                    call resolve_path_at
+                    jr c, _
+                    ; File was found, but repair the environment first
+                pop de ; Preserve hl
+                pop af
+                jr c, _execve_found_file
+                ld a, ':'
+                ld (de), a
+                jr _execve_found_file
+_:
+                pop hl
+                pop af
+
+_execve_path_search_next:
+                jp c, _execve_enoent
+
+                ld (hl), ':' ; Restore the colon
+                inc hl
+                jr _execve_path_search
+
+_execve_found_file:
+                push hl
+                    ld a, O_RDONLY | O_EXEC
+                    call perm_check_file
+                pop hl
+                jp c, _execve_enoent
+                jp nz, _execve_eaccess
+
+                ; Read/verify header
+                ld iy, proc_create_tixe_header
+                ld de, 0
+                ld bc, sizeof_tixeh
+                push hl
+                    call fs_read_file
+                pop hl
+                ; The file was found above, so it exists, but just in case,
+                jp c, _execve_enoent
+
+                ; Check header
+                push iy \ pop ix
+                ld a, 'T'
+                cp (ix + 0)
+                jp nz, _execve_enoexec
+                ld a, 'I'
+                cp (ix + 1)
+                jp nz, _execve_enoexec
+                ld a, 'X'
+                cp (ix + 2)
+                jp nz, _execve_enoexec
+                ld a, 'E'
+                cp (ix + 3)
+                jp nz, _execve_enoexec
+            pop de
+            ; The inode is needed later, but the argument list is needed now.
+            ex (sp), hl
+
+            ; Store environment and argument pointers and calculate their sizes.
+            ; These are referenced by proc_init_data_()
+            ld iy, (cur_process)
+            ld a, (iy + proc_ent_data_page)
+            ld (proc_create_arg_page), a
+            ld (proc_create_argv), hl
+            ld (proc_create_envp), de
+
+            call proc_get_arg_size_ ; argv
+            ld (proc_create_argv_size), bc
+            ld (proc_create_argc), de
+
+            ld hl, (proc_create_envp)
+            call proc_get_arg_size_ ; env
+            ld (proc_create_envp_size), bc
+            ld (proc_create_envp_count), de ; Used for allocation
+
+            call proc_alloc_text_
+            jp c, _execve_fail
+
+            ; Don't store the locations unless the next allocation succedes
+            push af
+            push hl
+                call proc_alloc_data_
+                jr nc, _
+                ; Free text section if the data allocation failed
+            pop hl
+            pop af
+            call gfree
+            jr _execve_fail
+
+_:
+                ; Free old allocations
+                ; TODO Use realloc in the allocation functions to avoid doing this
+                push af ; Data allocation
+                push hl
+                    ld iy, (cur_process)
+                    ld a, (iy + proc_ent_text_page)
+                    ld l, (iy + proc_ent_text_addr)
+                    ld h, (iy + proc_ent_text_addr+1)
+                    call gfree
+
+                    ld iy, (cur_process) ; Faster than push iy \ pop iy
+                    ld a, (iy + proc_ent_data_page)
+                    ld l, (iy + proc_ent_data_addr)
+                    ld h, (iy + proc_ent_data_addr+1)
+                    call gfree
+                pop hl
+                pop af
+
+                ld iy, (cur_process)
+                ld (iy + proc_ent_data_page), a
+                ld (iy + proc_ent_data_addr), l
+                ld (iy + proc_ent_data_addr+1), h
+
+            pop hl ; Text allocation
+            pop af
+
+            ld (iy + proc_ent_text_page), a
+            ld (iy + proc_ent_text_addr), l
+            ld (iy + proc_ent_text_addr+1), h
+
+            call proc_vfork_release_
+
+        pop hl ; Inode
+
+    ; All allocations are made, so there is no risk of failure for the rest,
+    ; the initial push af at the start of the function is gone since the
+    ; stack has been moved, and proc_create_sp_save is now open again (it is
+    ; used by proc_init_data_). In other words, the indentation can be brought
+    ; back down at this point.
+
+    push hl
+        call proc_init_text_
+    pop hl
+    ; Don't need the inode after this
+    call proc_init_data_
+
+    ; Close FD_CLOEXEC file descriptors
+    push iy \ pop hl
+    ld bc, proc_ent_fildes
+    add hl, bc
+    ld b, OPEN_MAX
+_execve_close_fds:
+    ld a, (hl)
+    bit BIT_FD_CLOEXEC, a
+    jr z, _
+    push hl
+        call filtab_dec_refs
+    pop hl
+    ld a, $FF
+    ld (hl), a
+_:
+    inc hl
+    djnz _execve_close_fds
+
+    ; The flags should already be set to this, but just in case,
+    ld a, PROC_USED
+    ld (iy + proc_ent_flags), a
+
+    ; Pages, return address, etc. were stored by proc_init_data_, so a normal
+    ; context restore will setup everything for execution
+
+    ;KERNEL_RAM_MAP()
+    jp proc_ctx_restore_
+
+_execve_enoent:
+        ld hl, ENOENT
+        jr _execve_fail
+_execve_eaccess:
+        ld hl, ENOENT
+        jr _execve_fail
+_execve_enomem:
+        ld hl, ENOMEM
+        jr _execve_fail
+_execve_enoexec:
+        ld hl, ENOENT
+        jr _execve_fail
+_execve_fail:
+        call proc_set_errno
+
+        ; Restore stack
+        ld sp, (proc_create_sp_save)
+    pop af
+    scf
+    ret po
+    ei
+    ret
+
+_execve_path_str:
+    .db "PATH",0
+; }}}
+
+
+;; Same as execve(), but use the current process's environ variable in the new
+;; one.
+; Parameters:
+;   (ix) - TIXE data
+;   (hl) - Array of arguments
+; Return:
+;   Only returns if an error occurs.
+;   
+execv: ; {{{
+    ld iy, (cur_process)
+    ex de, hl
+    ld l, (iy + proc_ent_prog_data_addr)
+    ld h, (iy + proc_ent_prog_data_addr+1)
+    ; environ = -4
+    dec hl \ dec hl \ dec hl; \ dec hl
+    ld a, (hl)
+    dec hl
+    ld l, (hl)
+    ld h, a
+    ex de, hl
+
+    jp execve
+; }}}
+
+
+;; Find a PID and empty slot for a child process in the current one.
+; Parameters:
+;   (hl) - Table entry of the process in which to look for a slot.
+; Return:
+;   c flag - Set if there are no more PIDs or child slots, reset otherwise.
+;   (hl) - Open child slot in current process.
+; Preserves:
+;   de, ix, iy
+;
+proc_get_next_child_: ; {{{
+    ld bc, proc_ent_children
+    ld hl, (cur_process)
+    add hl, bc
+    ld b, CHILD_MAX
+    ld c, a
+    xor a
+_:
+    cp (hl)
+    jr z, _
+    inc hl
+    djnz -_
+
+    scf
+    ret
+
+_:
+    ld a, c
+    ;or a ; Carry reset from cp
+    ret
+; }}}
+
+
+;; Forks the current process, but uses the parent process's RAM until an exec*()
+;; call is made.
+; The child process can safely call functions, though it should not modify any
+; variables or the existing stack (i.e. by return from the function which called
+; vfork()).
+;
+; Return:
+;   a - The PID of the child process to the parent process, 0 to the child
+;       process.
+;
+vfork: ; {{{
+    ld a, i
+    push af
+        di
+
+        call proc_get_open_
+        jp c, _vfork_fail
+        ; a = child PID
+        ; (hl) = child process entry
+
+        ex de, hl
+        push af
+            call proc_get_next_child_ ; Preserves de
+        pop bc ; Preserve f
+        jp c, _vfork_fail
+        ; b = child PID
+        ; (hl) = child slot
+        ; (de) = child process entry
+
+        ld (hl), b
+
+    ; All allocations are done, so we can clean up the stack (and have to for
+    ; the context save to work correctly)
+    pop af
+
+    ; Save the context as the parent so that it will carry over for the child.
+    ; The saved address is the return address from this function, so neither
+    ; process will return to the code following this.
+    ; a is set to the new pid for the parent and will be modified in the child's
+    ; process entry.
+    ld a, b
+    or a
+    push de \ pop ix ; Save the child process
+    call proc_ctx_save_
+
+    push bc ; b = child PID from above
+    push ix
+        pop de \ push de
+        ; Copy current process table to new one
+        ld hl, (cur_process)
+        ld bc, sizeof_proc_ent - CHILD_MAX ; Don't copy children
+        ldir
+
+        ; Parent process entry
+        ld iy, (cur_process)
+
+        ; Set VFORK flag of parent
+        ld a, (iy + proc_ent_flags)
+        or PROC_VFORK_PARENT
+        ld (iy + proc_ent_flags), a
+
+        ; Increment reference counts of allocations
+        ld a, (iy + proc_ent_text_page)
+        ld l, (iy + proc_ent_text_addr)
+        ld h, (iy + proc_ent_text_addr+1)
+        call galloc_ref
+
+        ld iy, (cur_process)
+        ld a, (iy + proc_ent_data_page)
+        ld l, (iy + proc_ent_data_addr)
+        ld h, (iy + proc_ent_data_addr+1)
+        call galloc_ref
+    pop iy ; Child process
+    pop bc ; b = Child PID
+
+    ; (ix) = parent
+    ld ix, (cur_process)
+
+    ; Set parent of child
+    ld a, (cur_pid)
+    ld (iy + proc_ent_parent), a
+
+    ; Change to child process
+    ld a, b
+    ld (cur_pid), a
+    ld (cur_process), iy
+
+    ; Set VFORK flag of child
+    ld a, (iy + proc_ent_flags)
+    or PROC_VFORKED
+    ld (iy + proc_ent_flags), a
+
+    ; Increment reference count of file descriptors
+    ld hl, (cur_process)
+    ld bc, proc_ent_fildes
+    add hl, bc
+    ex de, hl ; Use de becaue filtab_inc_refs preserves it
+    ld b, OPEN_MAX
+_:
+    ld a, (de)
+    ; Preserves bc, de
+    call filtab_inc_refs ; Checks if valid file descriptor
+    inc de
+    djnz -_
+
+    ; Clear children
+    ld hl, (cur_process)
+    ld bc, proc_ent_children
+    add hl, bc
+    ld b, CHILD_MAX
+    xor a
+_:
+    ld (hl), a
+    inc hl
+    djnz -_
+
+    ; Set a = 0 for the child process
+    xor a
+    ld (iy + proc_ent_ctx_af+1), a
+
+    jp proc_ctx_restore_
+
+_vfork_fail:
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Forks the current process.
+; Return:
+;   a - The PID of the child process to the parent process, 0 to the child
+;       process.
+;
+fork: ; {{{
+
+; }}}
+
+
+;; Waits for a child process to terminate.
+; If any child processes are currently in a zombie state, they will be released
+; and this will return.
+; Return:
+;   a - PID of the terminated child.
+;   [h]l - LSB of the error status of the child.
+;
+wait: ; {{{
+    or a
+    ld a, i
+    push af
+        di
+
+        ; If a child is already terminated, use it
+_wait_search_start:
+
+        ld iy, (cur_process)
+        ld bc, proc_ent_children
+        add iy, bc
+        ld b, CHILD_MAX
+        ld c, 0 ; Set to 1 if there are any children
+_wait_search_loop:
+        ld a, (iy)
+        or a
+        jr z, _
+        ld c, 1
+        push bc
+            call proc_deref_
+        pop bc
+        ld a, (hl)
+        and PROC_TERMINATED
+        jr nz, _wait_found
+_:
+
+        inc iy
+        djnz _wait_search_loop
+
+_wait_not_found:
+        ld a, c
+        or a
+        ; If there are no children
+        jr z, _wait_echild
+
+        ; If there are children but none have terminated, set the WAITING flag
+        ; and save the context. The next child that terminates will reset the
+        ; flag, allowing this process to be scheduled, set the LSB of its status
+        ; to this table entry's and set its PID to the MSB of this entry's
+        ; status.
+        ld iy, (cur_process)
+        ld a, (iy + proc_ent_flags)
+        or PROC_WAITING
+        ld (iy + proc_ent_flags), a
+
+        ; Push _wait_woken as the return address
+        ld hl, _wait_woken
+        push hl
+
+        jp proc_ctx_switch
+
+_wait_woken:
+        ; Kernel RAM is mapped and interrupts are enabled from proc_ctx_restore_
+        di
+        KERNEL_RAM_MAP()
+        ; iy = process table entry (from above)
+
+        ld a, (iy + proc_ent_status+1) ; PID of terminated child
+
+        ; Find the child spot
+        push iy \ pop hl
+        ld bc, proc_ent_children
+        add hl, bc
+        ; Have a counter even though the child should be in the list in case of
+        ; some errors
+        ld b, CHILD_MAX
+_:
+        cp (hl)
+        jr z, _wait_woken_found
+        inc hl
+        djnz -_
+
+        ; If the child is not actually a child, there was some error (probably
+        ; a process writing to an address it does not own).
+        ; TODO Should we just crash (because this is likely not the only problem
+        ; in the system now) or jump back to the start of this function to try
+        ; and recover?
+        jr _wait_search_start
+
+_wait_woken_found:
+        ; Clear out child entry
+        ld c, 0
+        ld (hl), c
+        push af
+            call proc_free_
+        pop af
+
+        ld l, (iy + proc_ent_status)
+        jr _wait_done
+
+_wait_found:
+        ; (hl) = terminated child
+        ; (iy) = child spot
+        ex de, hl
+        ld a, (iy)
+        call proc_free_ ; Preserves de
+        ld hl, proc_ent_status
+        add hl, de
+
+        ld l, (hl)
+        ld h, 0
+        ld a, (iy)
+        ld (iy), h ; Zero-out the child
+
+_wait_done:
+        ld c, a
+    pop af
+    ld a, c
+    ret po
+    ei
+    ret
+
+_wait_echild:
+        ld hl, ECHILD
+        ;jr _
+_:
+        call proc_set_errno
+    pop af
+    scf
+    ret po
+    ei
+    ret
+; }}}
+
+
+;; Set as the return address from a process. Simply maps kernel RAM and calls
+;; exit()
+;
+proc_exit_ret_cb_: ; {{{
+    KERNEL_RAM_MAP()
+    ;jp exit
+; }}}
+
+
+;; Exits from a process.
+; Parameters:
+;   hl - Exit status.
+;
+exit:
+_Exit:
+_exit: ; {{{
+    di
+
+    ld a, (cur_pid)
+    cp 1
+    ; If init terminates, panic
+    jp z, panic
+
+    ld iy, (cur_process)
+    ld (iy + proc_ent_status), l
+    ld (iy + proc_ent_status+1), h
+
+    ; Set the terminated flag (leave USED flag)
+    ld a, (iy + proc_ent_flags)
+    or PROC_TERMINATED
+    ld (iy + proc_ent_flags), a
+
+    call proc_vfork_release_
+
+    ; Close all file descriptors
+
+    ld hl, (cur_process)
+    ld bc, proc_ent_fildes
+    add hl, bc
+    ld b, OPEN_MAX
+__exit_close_fds:
+    ld a, (hl)
+    cp $FF
+    jr z, _
+    push hl
+        call filtab_dec_refs
+    pop hl
+_:
+    inc hl
+    djnz __exit_close_fds
+
+    ; Give all children to the init process (PID 1)
+
+    ld hl, (cur_process)
+    ld bc, proc_ent_children
+    add hl, bc
+    ld b, CHILD_MAX
+__exit_give_children:
+    ld a, (hl)
+    or a
+    jr z, _
+    push bc
+    push hl
+        ld hl, proc_table ; First process
+        call proc_get_next_child_
+        ; This should never happen as long as PROC_MAX <= CHILD_MAX+1 (which it
+        ; is right now).
+        ; Things should probably be kept this way since completely orphaning
+        ; processes is not ideal.
+        ;jr c, ???
+
+        ex de, hl
+        ; (de) = child slot
+    pop hl
+    pop bc
+    ld a, (hl)
+    ld (de), a
+
+_:
+    inc hl
+    djnz __exit_give_children
+
+    ; Free text and data sections
+
+    ; Move stack to kernel_tmp (no need to back the old one up)
+    ld sp, proc_create_tmp_stack
+
+    ld iy, (cur_process)
+    ld a, (iy + proc_ent_text_page)
+    ld l, (iy + proc_ent_text_addr)
+    ld h, (iy + proc_ent_text_addr+1)
+    call gfree
+
+    ld iy, (cur_process)
+    ld a, (iy + proc_ent_data_page)
+    ld l, (iy + proc_ent_data_addr)
+    ld h, (iy + proc_ent_data_addr+1)
+    call gfree
+
+    ; If the parent is waiting, notify it. and start its execution
+
+    ld iy, (cur_process)
+    ld a, (iy + proc_ent_parent)
+    call proc_deref_
+    jr c, __exit_no_parent
+    ; proc_ent_flags = 0
+    ld a, (hl)
+    and ~PROC_WAITING & $FF
+    cp (hl)
+    ; If the flags are not changed without PROC_WAITING, it is not set
+    jr z, __exit_not_waiting
+    ld (hl), a
+    ; Pass status by storing in the parent's status LSB and pass PID in the
+    ; parent's status MSB
+    ; TODO Use inc hl's when proc_ent_status becomes stable
+    ld a, proc_ent_status
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    ld a, (iy + proc_ent_status)
+    ld (hl), a
+    ld a, (cur_pid)
+    inc hl
+    ld (hl), a
+
+    ; Don't reset the USED flag, because the parent may be waiting for a
+    ; specific child process. Let it reset the flag when it reads this status.
+
+    ; Start execution of the parent immediately to avoid another child process
+    ; terminating in the meantime.
+
+    ; Move back to start of parent's entry
+    ld a, l
+    sub proc_ent_status+1
+    ld l, a
+    jr nc, _
+    dec h
+_:
+
+    ld a, (iy + proc_ent_parent)
+    ld (cur_pid), a
+    ld (cur_process), hl
+
+    jp proc_ctx_restore_
+
+__exit_not_waiting:
+    ; Start execution of next process like normal.
+    call proc_get_next_active_
+    ld (cur_pid), a
+    ld (cur_process), hl
+    jp proc_ctx_restore_
+
+__exit_no_parent:
+    ; If there is no parent, this is PID 1 or something was overwritten. In
+    ; either case, this is bad, so reboot (a.k.a. crash).
+    rst $00
+
+; }}}
+
+
+;; Frees a process's table entry.
+; The process must exist in a terminated state to be freed.
+; Parameters:
+;   a - PID of process to free.
+; Preserves:
+;   de, ix, iy
+;
+proc_free_: ; {{{
+    call proc_deref_
+    ret c
+
+    ld a, (hl)
+    bit BIT_PROC_USED, a
+    ret z ; If not used
+    bit BIT_PROC_TERMINATED, a
+    ret z ; Don't free a non-terminated process
+
+    ; Clear flags
+    xor a
+    ld (hl), a
+
+    ret
+; }}}
+

@@ -1,0 +1,78 @@
+;
+; pwd.z80
+;
+
+.nolist
+#include "tix.inc"
+#include "fcntl.inc"
+#include "unistd.inc"
+.list
+
+.org $0000
+.db "TIXE"
+.dw $100
+.dw $40
+.dw text
+.dw text_end - text
+.dw data
+.dw data_end - data
+
+text:
+tixe_sec_start("text")
+
+    lld iy, buf
+    ld bc, PATH_MAX+1
+    push iy
+        syscall getcwd_
+    pop hl
+    jr c, fail
+
+    lcall strlen
+    push hl \ pop iy
+    add hl, bc
+    ld (hl), '\n'
+    inc hl
+    ld (hl), 0
+    inc bc
+    ld a, STDOUT_FILENO
+    syscall write_
+
+    ld hl, 0
+    ret
+
+fail:
+    ld hl, -1
+    ret
+
+strlen:
+    ld bc, 0
+    xor a
+    cpir
+    ; Technically, we should check if bc = 0 (from overflow), but that is
+    ; impossible because there is at least 1 0 in the addres space from ld bc,
+    ; 0.
+
+    add hl, bc ; Reset hl
+
+    ; Negate and decrement bc
+    ld a, b
+    cpl
+    ld b, a
+    ld a, c
+    cpl
+    ld c, a
+    ; inc bc
+    ; dec bc
+    ret
+
+tixe_sec_end()
+text_end:
+
+data:
+tixe_sec_start("data")
+
+buf:
+    .fill PATH_MAX+1+1 ; +1 for new line and null
+
+tixe_sec_end()
+data_end:

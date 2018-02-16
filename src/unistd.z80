@@ -1,0 +1,735 @@
+;
+; unistd.z80
+;
+; Miscellaneous functions (I can't think of a better way to describe it).
+;
+
+
+;; Finds the inode of a file given its path.
+; Parameters:
+;   (de) - The path string.
+; Return:
+;   c flag - Reset if the file was found, set if it was not.
+;   hl - The inode of the last found path segment. TODO Don't document/use
+;       side-effect return values.
+;   (de) - Directly after the last found path segment in the passed string.
+;   c - The length of the last segment.
+; Preserves:
+;   ix
+;
+; TODO Implement symbolic links
+; TODO Set errno for certain cases (have to be careful because some functions do
+; not set errno as specifically) or return the error when it exists.
+;
+resolve_path: ; {{{
+    ld a, (de)
+    cp '/'
+    jr z, _respth_abs
+_respth_rel:
+    ld hl, (cur_process)
+    ld bc, proc_ent_cwd
+    add hl, bc
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    jp resolve_path_at
+_respth_abs:
+    inc de
+    ld hl, FS_ROOT
+    ;jp resolve_path_at
+; }}}
+
+
+;; Same as resolve_path, but start at a specified directory.
+; Parameters:
+;   hl - The inode of the directory to start the search from (1 for the root
+;   directory).
+;   (de) - The path string.
+; Return:
+;   c flag - Reset if the file was found, set if it was not.
+;   hl - The inode of the last found path segment.
+;   (de) - Directly after the last found path segment in the passed string.
+;   c - The length of the last segment.
+; Preserves:
+;   ix
+;
+; TODO Correctly handle (and figure out what the correct behavior is) multiple
+; and terminating slashes (e.g. "//abc", or "/abc/").
+;
+resolve_path_at: ; {{{
+    in a, (PORT_MEM_BANK_A)
+    push af
+        ld c, 0
+        ; Loop input:
+        ;   hl = inode number
+        ;   (de) = start of path segment
+        ;   c = length of previous name segment
+_respth_loop:
+        ; Get the length of the next segment
+        ex de, hl
+        ld b, 0
+        add hl, bc
+
+        ; Move past slashes, return if we reach a null byte
+_respth_skip_slash:
+        ld a, (hl)
+        cp '/'
+        jr nz, _
+        inc hl
+        jr _respth_skip_slash
+_:
+        cp 0
+        jr nz, _
+        ex de, hl
+        jr _respth_found
+_:
+
+        ; TODO Use strchr
+        push hl
+            ld b, NAME_MAX + 1
+            ld c, 0
+_respth_next_len:
+            ld a, (hl)
+            or a
+            jr z, _respth_nl_end
+            cp '/'
+            jr z, _respth_nl_end
+
+            inc c
+            inc hl
+            djnz _respth_next_len
+
+        ; If the loop does not break before NAME_MAX+1 characters
+        pop hl
+        jr _respth_fail
+
+_respth_nl_end:
+        pop hl
+        ex de, hl
+
+        ; If the length is 0
+        ld a, c
+        or a
+        jr z, _respth_found
+
+        ; If the path is ".", continue the loop
+        ;ld a, c
+        cp 1
+        jr nz, _
+        ld a, (de)
+        cp '.'
+        jr z, _respth_loop
+_:
+
+        ; Outputs the found inode in hl on success, but an unspecified value on
+        ; failure.
+        push de
+        push hl
+            call fs_search_dir
+            jr c, _respth_not_found
+        pop af ; Keep hl
+        pop de
+
+        jr _respth_loop
+
+_respth_found:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    or a
+    ret
+
+_respth_not_found:
+        pop hl ; Restore hl to before the directory search
+        pop de
+_respth_fail:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret
+; }}}
+
+
+;; Same as resolve_path, but does not include the final path segment.
+; If the string is "/", then the root directory inode is returned.
+; Parameters:
+;   (de) - The path string.
+; Return:
+;   c flag - Reset if the file was found, set if it was not.
+;   hl - The inode of the last found path segment.
+;   (de) - Directly after the last found path segment in the passed string.
+;   c - The length of the last segment.
+; Preserves:
+;   ix
+;
+resolve_path_dir: ; {{{
+    ld a, (de)
+    cp '/'
+    jr z, _respthd_abs
+_respthd_rel:
+    ld hl, (cur_process)
+    ld bc, proc_ent_cwd
+    add hl, bc
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    jp resolve_path_dir_at
+_respthd_abs:
+    inc de
+    ld hl, 1
+    ld a, (de) ; If the next byte is the null
+    or a
+    ret z
+    ;jp resolve_path_dir_at
+; }}}
+
+
+;; Same as resolve_path_dir, but start the search from a specified
+;; directory.
+; Parameters:
+;   hl - The inode of the directory to start the search from (1 for the root
+;   directory).
+;   (de) - The path string.
+; Return:
+;   c flag - Reset if the file was found, set if it was not.
+;   hl - The inode of the last found path segment.
+;   (de) - The last remaining path segment from the original string.
+; Preserves:
+;   ix
+;
+resolve_path_dir_at: ; {{{
+    in a, (PORT_MEM_BANK_A)
+    push af
+        ld c, 0
+        ; Loop input:
+        ;   hl = inode number
+        ;   (de) = start of path segment
+        ;   c = length of previous name segment
+_respthd_loop:
+        ; Get the length of the next segment
+        ex de, hl
+        ld b, 0
+        add hl, bc
+
+        ; Move past slashes, return if we reach a null byte
+_respthd_skip_slash:
+        ld a, (hl)
+        cp '/'
+        jr nz, _
+        inc hl
+        jr _respthd_skip_slash
+_:
+        cp 0
+        jr nz, _
+        ex de, hl
+        jr _respthd_found
+_:
+
+
+        push hl
+            ld b, NAME_MAX + 1
+            ld c, 0
+_respthd_next_len:
+            ld a, (hl)
+            or a
+            jr z, _respthd_nl_end
+            cp '/'
+            jr z, _respthd_nl_end
+
+            inc c
+            inc hl
+            djnz _respthd_next_len
+
+        ; If the loop does not break before NAME_MAX+1 characters
+        pop hl
+        jr _respthd_fail
+
+_respthd_nl_end:
+        pop hl
+        ex de, hl
+
+        ; a = The byte after the current segment
+        or a ; Sets zero flag if at the end of the string
+        jr z, _respthd_found
+
+        ; If the path is ".", continue the loop
+        ;ld a, c
+        cp 1
+        jr nz, _
+        ld a, (de)
+        cp '.'
+        jr z, _respthd_loop
+_:
+
+        ; Outputs the found inode in hl on success, but an unspecified value on
+        ; failure.
+        push de
+        push hl
+            call fs_search_dir
+            jr c, _respthd_not_found
+        pop af ; Keep hl
+        pop de
+
+        jr _respthd_loop
+
+_respthd_found:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    or a
+    ret
+
+_respthd_not_found:
+        pop hl ; Restore hl to before the directory search
+        pop de
+_respthd_fail:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret
+; }}}
+
+
+;; Changes the working directory of the current process.
+; Parameters:
+;   (de) - Path to new working directory.
+; Return:
+;   c flag - Reset on success, set on failure.
+; Preserves:
+;   ix, iy
+;
+; TODO Set errno
+chdir: ; {{{
+    call resolve_path
+    ret c
+
+    jp chdir_inode_
+; }}}
+
+
+;; Changes the working directory of the current process from a file descriptor.
+; Parameters:
+;   a - File descriptor of the directory.
+; Return:
+;   c flag - Reset on success, set on failure.
+; Preserves:
+;   ix, iy
+;
+fchdir: ; {{{
+    call fildes_deref_full
+    ret c
+
+    ; filtab_ent_inode = 0
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    ;jp chdir_inode_
+; }}}
+
+
+;; Changes the working directory of the current process from an inode.
+; Parameters:
+;   hl - Inode of the directory.
+; Return:
+;   c flag - Reset on success, set on failure.
+; Preserves:
+;   ix, iy
+;
+chdir_inode_: ; {{{
+    ; Make sure the file is a directory
+    call fs_get_mode ; Preserves hl (inode)
+    ret c
+
+    ; Type in MSB
+    ld a, b
+    and S_IFMT >> 8
+    cp S_IFDIR >> 8
+    jr z, _
+    scf
+    ret
+_:
+
+    ; Need search permission
+    push hl
+        ld a, O_SEARCH
+        call perm_check_file
+    pop hl
+    jr z, _
+    scf
+    ret
+_:
+
+    ex de, hl
+    ld hl, (cur_process)
+    ld bc, proc_ent_cwd
+    add hl, bc
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    or a
+    ret
+; }}}
+
+
+;; Gets the value of an environment variable.
+; Parameters:
+;   (de) - Name of the environment variable.
+; Return:
+;   c flag - Reset if the environment variables exists, set if not.
+;   (hl) - Value of the environment variable.
+; Preserves:
+;   de, iy, ix
+;
+getenv: ; {{{
+    ld hl, (cur_process)
+    ld bc, proc_ent_prog_data_addr
+    add hl, bc
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    ; environ = -4
+    dec hl \ dec hl \ dec hl; \ dec hl
+    ld a, (hl)
+    dec hl
+    ld l, (hl)
+    ld h, a
+
+    ; Get the length for strncmp()
+    ex de, hl
+    call strlen
+    ex de, hl
+
+    push de
+_getenv_loop:
+        ld e, (hl)
+        inc hl
+        ld d, (hl)
+        inc hl
+        ld a, d
+        or e
+        jr z, _getenv_not_found
+
+        ex (sp), hl
+        push bc
+        push de ; variable entry
+        push hl ; name to get
+            call strncmp
+        pop hl
+        pop de
+        pop bc
+        ex (sp), hl
+        jr nz, _getenv_loop
+
+        ; Variable found in (de)
+        ex de, hl
+        ld a, '='
+        call strchr
+        ; This shouldn't happen, but just in case
+        jr c, _getenv_not_found
+        inc de
+        ex de, hl
+    pop de
+    or a
+    ret
+
+_getenv_not_found:
+    pop de
+    scf
+    ret
+; }}}
+
+
+;; Sets an environment variable.
+; The string itself is added to the environment (it is not copied), so any
+; changes to it will change the environment. If a variable by the same name
+; already exists, it will be removed.
+; Parameters:
+;   (de) - String of the form <name>=<value>.
+; Return:
+;   c flag - Reset if the variable was added, set if not.
+;
+putenv: ; {{{
+    ex de, hl
+    ld a, '='
+    call strchr
+    ex de, hl
+    ; String is invalid
+    ret c
+
+    ; Get length of name part
+    ; or a
+    sbc hl, de
+    ld b, h \ ld c, l
+
+    ld hl, (cur_process)
+    ld a, proc_ent_prog_data_addr
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    ; environ = -4
+    dec hl \ dec hl \ dec hl; \ dec hl
+    ld a, (hl)
+    dec hl
+    ld l, (hl)
+    ld h, a
+
+    push hl
+    push de
+_putenv_loop:
+        ld e, (hl)
+        inc hl
+        ld d, (hl)
+        inc hl
+        ld a, d
+        or e
+        jr z, _putenv_not_found
+
+        ex (sp), hl
+        push bc
+        push de ; variable entry
+        push hl ; name to put
+            call strncmp
+        pop hl
+        pop de
+        pop bc
+        ex (sp), hl
+        jr nz, _putenv_loop
+
+    pop de
+    pop hl
+    ; Replace the variable at (hl)
+    ; TODO Allocate the strings on the heap and flag them somehow so that they
+    ; can be freed when this happens without freeing entries put by ealier calls
+    ; to this function.
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    inc hl
+    or a
+    ret
+
+_putenv_not_found:
+    pop de
+    pop bc ; Start of the environment
+    ; Add a new entry to the environment
+
+    ; Get size by subtracting the start
+    or a
+    sbc hl, bc
+    ; Need one more entry
+    ; TODO Grow the buffer exponentially? Not sure if that is possible since the
+    ; environ variable is accessable to applications in raw form. Maybe a
+    ; realloc_exp() function could be made that could keep track.
+    inc hl \ inc hl
+    ; ex bc, hl
+    push bc \ ex (sp), hl \ pop bc
+    ; (hl) = Start of environment
+    ; (de) = String to add
+    ; bc = new environment size
+
+    push bc
+    push de
+        call realloc
+    pop de
+    pop bc
+    ret c
+
+    ; Write new entry from the back
+    add hl, bc
+    dec hl
+    ld (hl), 0
+    dec hl
+    ld (hl), 0
+    dec hl
+    ld (hl), d
+    dec hl
+    ld (hl), e
+    ex de, hl
+
+    ld hl, (cur_process)
+    ld a, proc_ent_prog_data_addr
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    ; environ = -4
+    dec hl \ dec hl \ dec hl; \ dec hl
+    ld (hl), d
+    dec hl
+    ld (hl), e
+
+    or a
+    ret
+; }}}
+
+
+;; Gets the absolute path name of the current working directory.
+; This is an unsafe version of getcwd(), where the buffer size is assumed to be
+; at least PATH_MAX+1
+; Parameters:
+;   (iy) - Buffer to store the name. This should be at least PATH_MAX+1 bytes in
+;       length. TODO Pass in ix since fs_search_dir() uses iy?
+; Return:
+;   c flag - Reset on success, set if the path name is longer than the specified
+;       size (including the null bytes).
+;
+getwd: ; {{{
+    ld bc, PATH_MAX+1
+    ;jp getcwd
+; }}}
+
+
+;; Gets the absolute path name of the current working directory.
+; Parameters:
+;   (iy) - Buffer to store the name. TODO Pass in ix since fs_search_dir() uses
+;       iy?
+;   bc - Size of the buffer.
+; Return:
+;   c flag - Reset on success, set if the path name is longer than the specified
+;       size (including the null bytes).
+;
+getcwd: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        ; We are getting pointers to strings in the filesystem, so disable
+        ; interrupts just to be safe
+        di
+
+        ld hl, (cur_process)
+        ld de, proc_ent_cwd
+        add hl,de
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+
+        ; Start at the end of the buffer
+        push iy \ pop ix ; fs_search_dir() preserves ix, but not iy
+        dec bc \ dec bc ; Move to the last byte of the buffer and past the null
+        add ix, bc
+        ; Place the trailing slash (so that nothing has to be done if already at the
+        ; root directory) and null byte
+        ld (ix + 0), '/'
+        ld (ix + 1), 0
+
+        ; while dir is not root
+        ;   Resolve the parent ("..")
+        ;   Search the parent for this inode
+        ;   write the string to the current end of the buffer.
+        ;   prepend '/'
+        ;
+        ; hl = inode
+        ; (ix) = end of the buffer
+        ; (sp) = number of bytes left in the buffer
+        push bc
+_getcwd_loop:
+            ; See if at the root inode (1)
+            ld a, h
+            cp 0
+            jr nz, _
+            ld a, l
+            cp 1
+            jr z, _getcwd_done
+_:
+            ld de, _getcwd_parent_path
+            push hl
+                call resolve_path_at
+                ; hl = parent inode
+            pop de ; child inode
+            ; Just in case
+            jr c, _getcwd_fail
+
+            push hl
+                call fs_search_dir_inode
+            pop de
+            jr nc, _
+        pop bc \ jr _getcwd_fail
+_:
+            ; (hl) = child name
+            ; de = parent inode
+
+            ; See if there is enough space
+            ld bc, NAME_MAX ; The string may not be null-terminated
+            push de
+                call strnlen ; Preserves hl
+            pop de
+            inc bc ; Also need a '/'
+            ex (sp), hl
+            ; hl = size left
+            ; (sp) = child name
+            or a
+            sbc hl, bc
+            ; No enough space
+            jr nc, _
+        pop bc \ jr _getcwd_fail
+_:
+            ex (sp), hl
+            ; (sp) = new size left
+            ; (hl) = child name
+
+            ; Move the buffer head down (sbc ix, bc doesn't exist)
+            ; or a
+            push ix
+                ex (sp), hl
+                sbc hl, bc
+                ex (sp), hl
+            pop ix
+
+            push de ; inode
+                push ix \ pop de
+                ld a, '/'
+                ld (de), a
+                inc de
+                dec bc ; Don't copy the slash accounted for above
+                ; Use strncpy() so that a null byte is not placed at the end
+                call strncpy
+            pop hl ; inode
+
+            jr _getcwd_loop
+_getcwd_done:
+        pop bc
+
+        ; Copying was done from the end of the buffer, so now it all has to be moved
+        ; to the start (i.e. to the left bc bytes)
+        push ix \ pop hl
+        ld d, h \ ld e, l
+        sbc hl, bc
+        ex de, hl
+        ; (hl) = start of written data
+        ; (de) = start of buffer
+        ; TODO This is technically undefined behavior since the regions overlap
+        call strcpy
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+
+_getcwd_fail:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+
+_getcwd_parent_path:
+    .db "..",0
+; }}}
+
+

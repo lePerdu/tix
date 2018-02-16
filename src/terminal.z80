@@ -1,0 +1,569 @@
+;
+; terminal.z80
+;
+; Functions for the terminal emulator.
+;
+; Currently, this supports a single, global terminal for I/O.
+;
+
+#include "memmap.inc"
+#include "terminal.inc"
+#include "text.inc"
+
+
+;; Read data from the terminal (keyboard).
+; This currently processes input in canonical mode: if sufficient data is not
+; available in the input buffer, the function will block until the maximum
+; number of bytes to read are encountered or a new-line character ('\n') is
+; encountered. The end of the data in the buffer is marked by a null byte.
+;
+; Parameters:
+;   h - Terminal number.
+;   bc - Maximum number of bytes to read.
+;   (iy) - Buffer to read into.
+; Return:
+;   c flag - Reset if the read was successful, set if an error occurs.
+;   bc - Number of bytes read.
+; Preserves:
+;   ix, iy
+;
+terminal_read: ; {{{
+    ; At most MAX_INPUT = 255 bytes will be read, so the size is single-byte. If
+    ; the MSB is non-zero, set the size to 255.
+    ld a, b
+    ld b, c ; The size works better in b
+    or a
+    jr z, _
+    ld b, MAX_INPUT
+_:
+
+    ; TODO Implement non-canonical mode
+
+    ld a, (term_input_start)
+    ld c, a ; Stored for the loop
+    ld hl, term_input_buf
+    add a, l
+    ld l, a
+    ld a, 0
+    adc a, h
+    ld h, a
+
+    push iy \ pop de
+
+    ; Wait until there is a line available
+_:
+    ld a, (term_input_nlines)
+    or a
+    jr z, -_
+
+    ; Disable interrupts now to avoid race conditions when reading the line
+    ; and/or adjusting the start/nlines values.
+    ld a, i ; TODO Move this above so that di can occur right after the check
+    ld a, b ; Initial counter value
+    push af
+        di
+
+_termrd_loop:
+        ; No need to check for the end, since b is set to at most MAX_INPUT
+        ld a, c ; (term_input_start)
+        cp MAX_INPUT
+        jr nz, _
+        ld c, 0
+        ld a, (hl) ; Get the character before moving hl
+        ; inc'd later
+        ld hl, term_input_buf - 1
+        jr ++_ 
+_:
+        inc a
+        ld c, a
+        ld a, (hl)
+_:
+
+        ; Don't EOFs
+        ; TODO Lookup this
+        cp CHAR_EOF
+        jr z, _termrd_end_cutoff
+
+        ld (de), a
+
+        ; Check for line terminators (after copying them)
+        cp CHAR_NL
+        jr z, _termrd_end
+        ; TODO Lookup this
+        cp CHAR_EOL
+        jr z, _termrd_end
+
+        inc hl
+        inc de
+        djnz _termrd_loop
+        inc b ; Counter-act the below dec b
+
+_termrd_end:
+        dec b ; For when jumping here from checking for line terminators
+_termrd_end_cutoff: ; For when an EOF is reached (and not read into the buffer)
+        ld a, c
+        ld (term_input_start), a
+
+        ld a, (term_input_nlines)
+        dec a ; nlines is > 0 frfom the waiting above
+        ld (term_input_nlines), a
+
+    pop af
+    jp po, _
+    ei
+_:
+    ; a = initial counter
+    sub b
+    ; initial - final = characters read
+    ld b, 0
+    ld c, a
+    ret
+; }}}
+
+
+;; Write data to the terminal screen.
+; Parameters:
+;   h - Terminal number.
+;   bc - Number of bytes to write.
+;   (iy) - Buffer to read from.
+; Return:
+;   c flag - Reset if the read was successful, set if an error occurs.
+;   bc - Number of bytes written.
+; Preserves:
+;   ix, iy
+;
+terminal_write: ; {{{
+    ; TODO Do this is write() and ensure bc != 0 here 
+    ld a, b
+    or c
+    ret z
+
+    ; Ignore terminal number
+    push iy \ pop hl \ push hl
+    push bc
+_termwr_loop:
+        ld a, (hl)
+        push bc
+        push hl
+            call terminal_write_char_
+        pop hl
+        pop bc
+
+        inc hl
+        dec bc
+        ld a, b
+        or c
+        jr nz, _termwr_loop
+    pop bc
+    pop iy
+
+    jp text_copy_buf
+; }}}
+
+
+;; Writes a character to the terminal.
+; Parameters:
+;   a - The character to input.
+; Preserves:
+;   ix
+;
+terminal_write_char_: ; {{{
+    ; Do nothing for NUL and DEL
+    ; (this is the behavior of the VT52)
+    cp 0
+    ret z
+    cp CHAR_DEL
+    ret z
+
+    ld e, a
+    ld a, i
+    push af
+        di
+
+        ; Get the row and column count for all of the cases
+        call text_row_count_
+        ld b, a
+        call text_col_count_
+        ld c, a
+
+        ld a, e
+        cp CHAR_UP
+        jr z, _termwc_up
+        cp CHAR_DOWN
+        jr z, _termwc_down
+        cp CHAR_RIGHT
+        jr z, _termwc_right
+        cp CHAR_LEFT
+        jr z, _termwc_left
+        ; Same as left (not sent if processed in terminal_input for
+        ; canonical mode)
+        cp CHAR_BS
+        jr z, _termwc_bs
+        ; Get and set cursor position
+        cp CHAR_GPOS
+        jr z, _termwc_gpos
+        cp CHAR_SPOS
+        jr z, _termwc_spos
+
+        ; putc handles NL/LF and CR, including CR in LF (for now)
+        call text_putc
+
+_termwc_finish:
+    pop af
+    ret po
+    ei
+    ret
+
+_termwc_up:
+        ld a, (text_row)
+        or a
+        jr z, _termwc_finish
+        dec a
+        call text_set_row
+        jr _termwc_finish
+
+_termwc_down:
+        ld a, (text_row)
+        dec b
+        cp b
+        jr z, _termwc_finish
+        inc a
+        call text_set_row
+        jr _termwc_finish
+
+_termwc_right:
+        ld a, (text_col)
+        dec c
+        cp c
+        jr z, _termwc_finish
+        inc a
+        call text_set_col
+        jr _termwc_finish
+
+_termwc_bs:
+_termwc_left:
+        ld a, (text_col)
+        or a
+        jr z, _termwc_finish
+        dec a
+        call text_set_col
+        jr _termwc_finish
+
+_termwc_gpos:
+_termwc_spos:
+        jr _termwc_finish ; TODO Implement
+        ; Just put 'Y' in the buffer
+        ld (term_esc_buf), a
+        ld a, 1
+        ld (term_esc_idx), a
+        jp _termwc_finish
+
+_termwc_pe_args:
+        ;ld b, a
+        ld a, (term_esc_idx)
+        ld c, a
+        ld hl, term_esc_buf
+        ld e, (hl) ; First in the buffer
+        add a, l
+        ld l, a
+        ld a, 0
+        adc a, h
+        ld h, a
+
+        ld (hl), b
+
+        ld a, e
+        ; The escape character must be 'Y' (for now)
+        cp 'Y'
+        jp nz, _termwc_finish
+
+        ld a, c ; The original index
+        cp 2 ; 3 elements: Y row col
+        jr z, _
+        ; Update the index and exit if not at the end
+        inc a
+        ld (term_esc_idx), a
+        jp _termwc_finish ; not jp _termwc_finish
+
+_:
+        push hl
+            call text_cursor_off
+        pop hl
+
+        ld a, (hl) ; (hl) = col
+        sub $20
+        ; If past the end of the screen, move to the end
+        cp c
+        jr c, _
+        ld a, c
+        dec a
+_:
+        ld (text_col), a
+
+        ; Same procedure for the row
+        dec hl
+        ld a, (hl)
+        sub $20
+        cp b
+        jr c, _
+        ld a, b
+        dec a
+_:
+        ld (text_row), a
+
+        call text_cursor_on
+        jp _termwc_finish
+; }}}
+
+
+;; Appends data to the input buffer for the terminal.
+; Characters are also echoed to the screen.
+; Control characters perform their specified functions.
+; Parameters:
+;   a - The character to input.
+; Preserves:
+;   ix
+;
+terminal_input: ; {{{
+    ld h, a ; Character
+
+    ; Process input flags first
+    cp CHAR_NL
+    jr nz, _
+
+    ld a, (term_iflag)
+    and INLCR
+    jr z, ++_ ; Can skip over CR
+
+    ; Switch to CR (but don't perform CR-based checks/translations)
+    ld a, CHAR_CR
+    ld h, a
+    jr ++_ ; Skip over CR checks
+
+_:
+    cp CHAR_CR
+    jr nz, _
+    ld a, (term_iflag)
+    bit BIT_IGNCR, a
+    jr nz, _
+    bit BIT_ICRNL, a
+    jr z, _
+    ld a, CHAR_NL
+    ld h, a
+_:
+
+    ; Check canonical-mode flags
+    ld a, (term_lflag)
+    and ICANON
+    jr z, _termai_no_canon
+    ld a, h
+    ; TODO Lookup these in terminal settings
+    cp CHAR_ERASE
+    jr z, _termai_erase
+    cp CHAR_KILL
+    jp z, _termai_kill
+    cp CHAR_NL ; Checked above too, but not too big of a deal
+    jr nz, _
+    ; TODO Only call this when there is space in the input buffer
+    call _termai_inc_lines
+    ld a, (term_lflag)
+    and ECHONL
+    jr nz, _termai_echo ; If set, echo, no matter if ECHO is not set
+    jr _termai_canon
+_:
+    ; TODO Lookup these
+    cp CHAR_EOL
+    jr nz, _
+    call _termai_inc_lines
+    jr _termai_no_echo
+_:
+    cp CHAR_EOF
+    jr nz, _
+    call  _termai_inc_lines
+    jr _termai_no_echo
+_:
+
+_termai_no_canon:
+    ; Nothing special to do, this is just here to skip ERASE and KILL checks.
+_termai_canon:
+    ld a, (term_lflag)
+    and ECHO
+    jr z, _termai_no_echo
+
+_termai_echo:
+
+    ; Echo the character
+    ld a, h
+    push hl
+        call terminal_write_char_
+        call text_copy_buf
+    pop hl
+
+_termai_no_echo:
+    ld a, (term_input_start)
+    ld l, a
+    ld a, (term_input_end)
+    inc a
+    ; Wrap to the beginning of the buffer
+    cp MAX_INPUT+1
+    jr nz, _
+    xor a
+_:
+    cp l
+    ret z ; No more room
+    ld (term_input_end), a
+    dec a ; Go back to the current end
+    ; a = end offset
+    ; hl = a + term_input_buf
+    ; Kind of awkward but it avoids using any registers but a, h, and l
+    add a, term_input_buf & $FF
+    ld l, a
+    ld a, h ; The character to write
+    ld h, term_input_buf >> 8
+    jr nc, _
+    inc h
+_:
+    ld (hl), a
+
+    ret
+
+    ; Called as a sub-routine
+_termai_inc_lines:
+    ld a, (term_input_nlines)
+    inc a ; Won't overflow since MAX_INPUT < 256
+    ld (term_input_nlines), a
+    ret
+
+_termai_erase:
+    ld a, (term_input_start)
+    ld l, a
+    ld a, (term_input_end)
+    cp l
+    ret z
+
+    or a
+    jr nz, _
+    ld a, MAX_INPUT+1 ; The dec a will set this properly
+_:
+    dec a
+    ld (term_input_end), a
+
+    ld a, (term_lflag)
+    and ICANON | ECHO | ECHOE
+    cp  ICANON | ECHO | ECHOE
+    ret nz
+
+    ; Actually erase the character on screen
+    call text_cursor_off
+
+    ld a, (text_col)
+    or a
+    jr nz, _
+    ; If column and row are 0, do nothing
+    ; This would usually not happen since there is/was data in the input buffer,
+    ; but is is technically possible for data in the buffer to be off-screen.
+    ld a, (text_row)
+    or a
+    jr z, _termai_ee_end
+
+    dec a
+    ld (text_row), a
+    ld a, c ; dec a will set the column properly
+_:
+    dec a
+    ld (text_col), a
+
+    ld a, ' '
+    call text_putc_inplace
+
+_termai_ee_end:
+    jp text_cursor_on
+
+_termai_kill:
+    ; Check if the buffer is empty
+    ld a, (term_input_start)
+    ld b, a ; Kept to mark the start in the loop
+    ld a, (term_input_end)
+    cp b
+    ret z
+
+    dec a ; term_input_end is 1 past the end of the data
+    ld hl, term_input_buf
+    add a, l
+    ld l, a
+    ld a, 0
+    adc a, h
+    ld h, a
+
+    ld c, 0
+    ld a, (term_lflag)
+    and ICANON | ECHO | ECHOK
+    cp  ICANON | ECHO | ECHOK
+    jr nz, _
+    ld c, 1 ; as a flag for the loop
+    push bc
+    push hl
+        call text_cursor_off
+    pop hl
+    pop bc
+_:
+
+_termai_ek_loop:
+    ld a, (hl)
+
+    cp CHAR_NL
+    jr z, _termai_ek_end
+    cp CHAR_EOL
+    jr z, _termai_ek_end
+    cp CHAR_EOF
+    jr z, _termai_ek_end
+
+    ld a, (term_input_end)
+    cp b
+    jr z, _termai_ek_end
+    or a
+    ; Wrap to the end of the buffer
+    jr nz, _
+    ; dec a and dec hl get to the proper values
+    ld a, MAX_INPUT+1
+    ld hl, term_input_buf + MAX_INPUT+1
+_:
+    dec a
+    ld (term_input_end), a
+    dec hl
+
+    ; The flag is checked every iteration, but this allows for using a single
+    ; loop
+    ld a, c
+    or a
+    jr z, _termai_ek_loop
+
+    ld a, (text_col)
+    or a
+    jr nz, _
+    ; If column and row are 0, do nothing
+    ; This would usually not happen since there is/was data in the input buffer,
+    ; but is is technically possible for data in the buffer to be off-screen.
+    ld a, (text_row)
+    or a
+    jr z, _termai_ek_end
+    dec a
+    ld (text_row), a
+    ld a, c ; dec a will set the column properly
+_:
+    dec a
+    ld (text_col), a
+
+    ld a, ' '
+    push bc
+    push hl
+        call text_putc_inplace
+    pop hl
+    pop bc
+
+    jr _termai_ek_loop
+
+_termai_ek_end:
+    jp text_cursor_on
+; }}}
+
