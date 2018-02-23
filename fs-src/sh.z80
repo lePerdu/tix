@@ -366,7 +366,7 @@ shell_exit: ; {{{
     syscall exit_
 ; }}}
 
-#include "test/string.z80"
+#include "fs-src/string.z80"
 
 tixe_sec_end()
 text_end:

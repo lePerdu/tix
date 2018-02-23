@@ -94,11 +94,14 @@ DEFINE_OR_MASK(PROC_TERMINATED, 7)
 ; offsets.
 ;   errno - Errno value for the process.
 ;   environ - Pointer to the environment.
+;   dirname_dot - Static string to be returned by dirname when the directory is
+;       "." (current working directory).
 ;
-proc_os_data_environ    .equ 0
-proc_os_data_errno      .equ 2
+proc_os_data_dirname_dot    .equ 0
+proc_os_data_environ        .equ 2
+proc_os_data_errno          .equ 4
 
-sizeof_proc_os_data .equ 4
+sizeof_proc_os_data .equ 6
 
 ;; Structure for executable file format (TIXE) header
 ;   32  tixeh_magic - Magic string "TIXE".

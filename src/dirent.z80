@@ -101,27 +101,36 @@ readdir: ; {{{
     inc hl
     ; DIR_dirent = 4
     ex de, hl
+_readdir_read_next:
+    push bc
     push de
+    push hl
         call fs_next_direntry
     pop de
+    pop hl
+    pop bc
     jr nc, _
     ; Restore hl on error
-    ex de, hl
     dec hl \ dec hl \ dec hl \ dec hl ; Does not affect flags
     ret
 _:
-
     ; Increment the index
+    inc bc
+    ; If the entry has an inode of 0, go to the next one
+    ld a, (hl)
+    inc hl
+    or (hl)
+    dec hl
+    ex de, hl
+    jr z, _readdir_read_next
+
     ld h, d \ ld l, e
     dec hl
+    ld (hl), b
     dec hl
-    inc (hl)
-    inc hl
-    jr nz, _
-    inc (hl)
-_:
+    ld (hl), c
     ; Move back to the start
-    dec hl \ dec hl \ dec hl
+    dec hl \ dec hl
     ret
 ; }}}
 

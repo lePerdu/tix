@@ -1,0 +1,78 @@
+;
+; rmdir.z80
+;
+
+.nolist
+#include "tix.inc"
+#include "fcntl.inc"
+#include "unistd.inc"
+.list
+
+.org $0000
+.db "TIXE"
+.dw $100
+.dw $40
+.dw text
+.dw text_end - text
+.dw data
+.dw data_end - data
+
+text:
+tixe_sec_start("text")
+
+    ; int main(int argc, char *argv[])
+    ; Frame pointer
+    ld ix, 0
+    add ix, sp
+argc .equ 2
+argv .equ 4
+
+    ; Need 2 arguments (with exec name)
+    ld b, (ix + argc)
+    ld c, (ix + argc+1)
+    dec bc
+    ld a, b
+    or c
+    jr z, done
+
+    ld l, (ix + argv)
+    ld h, (ix + argv+1)
+    inc hl \ inc hl
+rm_dirs:
+    ; (hl) = file name
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+
+    syscall rmdir_
+    jr c, error_rm
+
+done:
+    ld hl, 0
+    ret
+
+error_rm:
+    lld iy, error_str
+    ld bc, error_str_len
+    ld a, STDERR_FILENO
+    syscall write_
+    jr error
+
+error_usage:
+error:
+    ld hl, -1
+    syscall exit_
+
+tixe_sec_end()
+text_end:
+
+data:
+tixe_sec_start("data")
+
+error_str:
+    .db "cannot remove dir\n"
+error_str_len .equ $ - error_str
+
+tixe_sec_end()
+data_end:
+

@@ -135,6 +135,7 @@ _:
 ;     ld h, a
 ;     ret
 
+
 ;; Sets the errno value for the current process.
 ; Parameters:
 ;   hl - The new errno value.
@@ -390,14 +391,15 @@ proc_ctx_switch: ; {{{
 ; Kernel RAM must be mapped to use these.
 proc_create_sp_save     .equ kernel_tmp + 0
 ; Page of arguments and environment (both in program data)
-proc_create_arg_page    .equ kernel_tmp + 2
-proc_create_envp        .equ kernel_tmp + 3
-proc_create_envp_size   .equ kernel_tmp + 5
-proc_create_envp_count  .equ kernel_tmp + 7
-proc_create_argv        .equ kernel_tmp + 9
-proc_create_argv_size   .equ kernel_tmp + 11 ; Total size of arguments
-proc_create_argc        .equ kernel_tmp + 13 ; Number of arguments
-proc_create_tixe_header .equ kernel_tmp + 17
+proc_create_name        .equ kernel_tmp + 2
+proc_create_envp        .equ kernel_tmp + 5
+proc_create_arg_page    .equ kernel_tmp + 4
+proc_create_envp_size   .equ kernel_tmp + 7
+proc_create_envp_count  .equ kernel_tmp + 9
+proc_create_argv        .equ kernel_tmp + 11
+proc_create_argv_size   .equ kernel_tmp + 13 ; Total size of arguments
+proc_create_argc        .equ kernel_tmp + 15 ; Number of arguments
+proc_create_tixe_header .equ kernel_tmp + 19
 proc_create_tmp_stack   .equ kernel_tmp_end
 
 
@@ -454,7 +456,7 @@ _:
 ; Parameters:
 ;   (hl) - List (in bank C).
 ;   (de) - Location to copy to.
-; TODO Relocate strings
+;
 proc_arg_copy_: ; {{{
     ld a, (proc_create_arg_page)
     out (PORT_MEM_BANK_A), a
@@ -759,7 +761,7 @@ proc_init_data_: ; {{{
     or ALLOC_NODE_EMPTY
     ld (hl), a
 
-    ; Store the new stack location in the stack pointer (fitting, huh), but
+    ; Store the new stack location in the stack pointer (fitting, huh?), but
     ; don't initialize the stack until after the arguments are copied.
     ; (hl) = bottom of stack
     ld c, (ix + tixeh_stack_size)
@@ -773,8 +775,24 @@ proc_init_data_: ; {{{
     ld e, (iy + proc_ent_data_addr)
     ld d, (iy + proc_ent_data_addr+1)
 
-    ld hl, (proc_create_argv)
-    call proc_arg_copy_
+    push de ; Save the starting argv address for later
+        ; Reserve space for the executable name (the address isn't known until after
+        ; the arguments are copied)
+        inc de \ inc de
+
+        ld hl, (proc_create_argv)
+        call proc_arg_copy_
+    pop hl
+    ; (de) = top of data section
+    ; (hl) = start of argv
+
+    ; Write the executable name to the first element of the argv array
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    ; Copy the name to after the array
+    ld hl, (proc_create_name)
+    call strcpy
 
     push de
         ld hl, (proc_create_envp)
@@ -957,6 +975,8 @@ execve: ; {{{
         push hl
             push de
                 push ix \ pop de
+                ld (proc_create_name), de
+
                 push de
                     call resolve_path
                 pop de
@@ -1057,8 +1077,18 @@ _execve_found_file:
             ld (proc_create_envp), de
 
             call proc_get_arg_size_ ; argv
-            ld (proc_create_argv_size), bc
+            ; Also include the executable name
+            inc de
             ld (proc_create_argc), de
+
+            push bc
+                ld hl, (proc_create_name)
+                call strlen
+                ; Also allocate for null byte and pointer
+                inc bc \ inc bc \ inc bc
+            pop hl
+            add hl, bc
+            ld (proc_create_argv_size), hl
 
             ld hl, (proc_create_envp)
             call proc_get_arg_size_ ; env
@@ -1189,7 +1219,7 @@ _execve_path_str:
 ;   (hl) - Array of arguments
 ; Return:
 ;   Only returns if an error occurs.
-;   
+;
 execv: ; {{{
     ld iy, (cur_process)
     ex de, hl

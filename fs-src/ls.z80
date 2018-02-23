@@ -29,12 +29,13 @@ argv .equ 4
 
     ld l, (ix + argc)
     ld h, (ix + argc+1)
-    ld bc, 1
+    ld bc, 2
     sbc hl, bc
     jr c, ls_cwd
 ls_argv_dir:
     ld l, (ix + argv)
     ld h, (ix + argv+1)
+    inc hl \ inc hl
     ld e, (hl)
     inc hl
     ld d, (hl)

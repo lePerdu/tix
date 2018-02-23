@@ -778,6 +778,90 @@ _fsnde_fail:
 ; }}}
 
 
+;; Determines whether a file can be removed directly (is a not a non-empty
+;; directory).
+; This does not check permissions, only the file itself.
+; Parameters:
+;   hl - Inode of the file.
+; Return:
+;   c flag - Reset if the file can be removed, set if not.
+; Preserves:
+;   ix, iy
+;
+fs_can_remove: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        push hl
+            call fs_search_inode_
+        pop de
+        jr c, _fs_canrem_cannot
+        out (PORT_MEM_BANK_A), a
+
+        ; inode_mode = 0
+        ; Type is is MSB
+        inc hl
+        ld a, (hl)
+        and S_IFMT >> 8
+        cp S_IFDIR >> 8
+        jr nz, _fs_canrem_can
+
+        ; inode_size = 2
+        inc hl
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+
+        ; divide by sizeof_fs_direntry = 16
+        srl b \ rr c
+        srl b \ rr c
+        srl b \ rr c
+        srl b \ rr c
+
+        ; Don't count the parent
+        dec bc
+
+        ; Look through the directory to see if all entries except the first one
+        ; ("..") are deleted (inode is 0).
+        ld de, sizeof_inode - (inode_size + 1) + sizeof_fs_direntry
+        add hl, de
+
+        ld de, sizeof_fs_direntry
+_:
+        ld a, b
+        or c
+        jr z, _fs_canrem_can
+
+        ld a, (hl)
+        inc hl
+        or (hl)
+        jr nz, _fs_canrem_cannot
+        inc hl
+
+        dec bc
+        jr -_
+
+_fs_canrem_can:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+
+_fs_canrem_cannot:
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+_:
+; }}}
+
+
 ;; Gets the size of a file.
 ; Parameters:
 ;   hl - The inode.
@@ -798,9 +882,8 @@ fs_get_mode: ; {{{
         push hl
             call fs_search_inode_
         pop de
-        ; Doing this 3 times is kind of odd but I think the most efficient
-        ex de, hl
         jr nc, _
+        ex de, hl
     pop af
     out (PORT_MEM_BANK_A), a
     scf
@@ -809,7 +892,6 @@ fs_get_mode: ; {{{
     ret
 _:
         out (PORT_MEM_BANK_A), a
-        ex de, hl
         ; inode_mode = 0
         ld c, (hl)
         inc hl
@@ -842,9 +924,9 @@ fs_get_size: ; {{{
 
         push hl
             call fs_search_inode_
-        pop hl
-        ex de, hl
+        pop de
         jr nc, _
+        ex de, hl
     pop af
     out (PORT_MEM_BANK_A), a
     scf
@@ -853,7 +935,6 @@ fs_get_size: ; {{{
     ret
 _:
         out (PORT_MEM_BANK_A), a
-        ex de, hl
         ; inode_size = 2
         inc hl
         inc hl
@@ -891,8 +972,8 @@ fs_get_uid_gid: ; {{{
             call fs_search_inode_
         pop de
         ; Doing this 3 times is kind of odd but I think the most efficient
-        ex de, hl
         jr nc, _
+        ex de, hl
     pop af
     out (PORT_MEM_BANK_A), a
     scf
@@ -901,7 +982,6 @@ fs_get_uid_gid: ; {{{
     ret
 _:
         out (PORT_MEM_BANK_A), a
-        ex de, hl
         ; inode_uid = 4
         inc hl \ inc hl \ inc hl \ inc hl
         ld c, (hl)
@@ -1824,6 +1904,19 @@ fs_create_direntry: ; {{{
     push af
         di
 
+        ; Make sure the name is unused
+        push bc
+        push de
+        push hl
+            ex de, hl
+            call strlen
+            ex de, hl
+            call fs_search_dir
+        pop hl
+        pop de
+        pop bc
+        jr nc, _fscd_fail
+
         push bc
         push de
         push hl
@@ -1848,7 +1941,7 @@ fs_create_direntry: ; {{{
             jr nz, _
             scf
 _:
-            ld (hl), a ; Doing this doesn't hurt anything
+            ld (hl), a ; Doing this doesn't hurt anything on overflow
 _fscd_inc_nlinks_end:
         pop hl
         pop de
@@ -2340,7 +2433,7 @@ _:
     djnz -_
 
     ld hl, kernel_tmp
-    ld bc, sizeof_fs_direntry
+    ld bc, sizeof_inode_entry
     ; Return with its status. (It should be nc, since we are only writing 0s.)
     jp flash_write_buf
 ; }}}

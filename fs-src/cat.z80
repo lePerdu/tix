@@ -29,12 +29,14 @@ argv .equ 4
 
     ld c, (ix + argc)
     ld b, (ix + argc+1)
+    dec bc
     ld a, b
     or c
     jr z, done
 
     ld l, (ix + argv)
     ld h, (ix + argv+1)
+    inc hl \ inc hl
 cat_files:
     ld e, (hl)
     inc hl

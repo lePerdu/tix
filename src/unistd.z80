@@ -108,13 +108,13 @@ _respth_nl_end:
         pop hl
         ex de, hl
 
-        ; If the length is 0
+        ; If length is 0
         ld a, c
         or a
         jr z, _respth_found
 
         ; If the path is ".", continue the loop
-        ;ld a, c
+        ; ld a, c
         cp 1
         jr nz, _
         ld a, (de)
@@ -226,7 +226,6 @@ _:
         jr _respthd_found
 _:
 
-
         push hl
             ld b, NAME_MAX + 1
             ld c, 0
@@ -249,12 +248,13 @@ _respthd_nl_end:
         pop hl
         ex de, hl
 
-        ; a = The byte after the current segment
-        or a ; Sets zero flag if at the end of the string
+        ; a = character after current segment
+        ; If a = 0, this is the last segment, so we're done
+        or a
         jr z, _respthd_found
 
         ; If the path is ".", continue the loop
-        ;ld a, c
+        ld a, c
         cp 1
         jr nz, _
         ld a, (de)

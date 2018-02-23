@@ -206,8 +206,9 @@ unlock_flash_   .equ 51
 ;; OS static data.
 ; These should be accessed via dld instructions, as they are negative offsets
 ; from the program's data section.
-errno   .equ -4
-environ .equ -2
+_dirname_dot .equ -6
+environ .equ -4
+errno   .equ -2
 
 #endif ; TIX_INC_
 

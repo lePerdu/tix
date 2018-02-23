@@ -978,7 +978,6 @@ link: ; {{{
             call resolve_path_dir
             ; hl = New directory inode
             ; (de) = Filename
-            ; TODO Check if the filename already exists
         pop bc ; bc = File inode
 
         ; TODO Should links to directories be allowed? It works fine in the
@@ -1024,28 +1023,8 @@ remove: ; This works for any file type
         push hl
             call resolve_path_at
             jr c, _
-            call fs_get_mode
-            ld a, b
-            and S_IFMT >> 8
-            cp S_IFDIR >> 8
-            ; TODO Should this work for directories? It does with the
-            ; filesystem, but is usually disallowed in Linux.
-            jr z, _unlink_dir
-_unlink_reg:
-            or a
-            jr _
-_unlink_dir:
-            ; TODO Read mode and size into a buffer to avoid searching for the
-            ; file twice
-            call fs_get_size
-            ; TODO How to tell if the directory is empty? Have a special
-            ; function, not report the ".." empty in the size, check the size
-            ; against sizeof_dir_entrty istead of 0, etc. Checking against 0 is
-            ; wrong.
-            ld a, b
-            or c
-            jr z, _
-            scf
+            call fs_can_remove
+            ; Take its status
 _:
         pop hl
         pop de
@@ -1082,7 +1061,7 @@ rmdir: ; {{{
         di
 
         call resolve_path_dir
-        ret c
+        jr c, _rmdir_error
 
         push de
         push hl
@@ -1092,22 +1071,10 @@ rmdir: ; {{{
             ld a, b
             and S_IFMT >> 8
             cp S_IFDIR >> 8
-            ; TODO Should this work for directories? It does with the
-            ; filesystem, but is usually disallowed in Linux.
             jr nz, _rmdir_invalid
 
-            ; TODO Read mode and size into a buffer to avoid searching for the
-            ; file twice
-            call fs_get_size
-            ; TODO How to tell if the directory is empty? Have a special
-            ; function, not report the ".." entry in the size, check the size
-            ; against sizeof_fs_direntry istead of 0, etc.
-            ld hl, sizeof_fs_direntry
-            or a
-            sbc hl, bc
-            ; If the directory is non-empty, carry is set, so there is no need
-            ; to set it. If the directory is empty, carry is reset, so there is
-            ; no need to set it.
+            call fs_can_remove
+            ; Take its return status
             jr _
 _rmdir_invalid: ; Not an empty directory
             scf
@@ -1157,7 +1124,11 @@ rename: ; {{{
         pop de
         jr c, _rename_fail
 
-        call remove
+        ; Don't use remove() because we don't want to check if a directory is
+        ; empty
+        call resolve_path_dir
+        jr c, _rename_fail
+        call fs_delete_direntry
         jr c, _rename_fail
 
     pop af

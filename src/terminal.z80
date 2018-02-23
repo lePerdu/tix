@@ -468,7 +468,7 @@ _:
 
     dec a
     ld (text_row), a
-    ld a, c ; dec a will set the column properly
+    call text_col_count_ ; dec a will set the column properly
 _:
     dec a
     ld (text_col), a
@@ -549,7 +549,7 @@ _:
     jr z, _termai_ek_end
     dec a
     ld (text_row), a
-    ld a, c ; dec a will set the column properly
+    call text_col_count_ ; dec a will set the column properly
 _:
     dec a
     ld (text_col), a

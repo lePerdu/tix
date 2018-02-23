@@ -591,3 +591,93 @@ _:
 
 ; }}}
 
+
+;; Extracts the last component of a filename.
+; The passed string may be modified/part of the returned string, so both should
+; not be modified.
+; Parameters:
+;   (hl) - Full pathname.
+; Return:
+;   (de) - String storing the base name of the original path.
+; Preserves:
+;   hl, ix, iy
+;
+basename: ; {{{
+    ld a, '/'
+    lcall strrchr
+    jr c, _basename_already
+
+    inc de
+    ld a, (de)
+    dec de
+    or a
+    jr nz, _
+    ; If at a trailing slash, see if at the beginning of the string
+    sbc hl, de
+    add hl, de ; z not affected
+    jr z, _
+    ; Have trailing '/' and the path is not "/", so delete it and restart the
+    ; while process.
+    xor a
+    ld (de), a
+    jr basename
+_:
+    ret
+
+_basename_already:
+    ; If there is no '/', return the original string
+    ld d, h \ ld e, l
+    ret
+; }}}
+
+
+;; Extracts the directory portion of a path name.
+; The passed string may be modified/part of the returned string, so both should
+; not be modified.
+; Parameters:
+;   (hl) - Full pathname.
+; Return:
+;   (de) - String storing the directory of the original path. This may be
+;       overwritten by a future call to dirname.
+; Preserves:
+;   hl, ix, iy
+;
+dirname: ; {{{
+    ld a, '/'
+    lcall strrchr
+    jr c, _dirname_cur
+
+    inc de
+    ld a, (de)
+    dec de
+    or a
+    jr nz, _
+    ; If at a trailing slash, see if at the beginning of the string
+    sbc hl, de
+    add hl, de ; z not affected
+    jr z, _dirname_root ; Path is "/"
+    ; Have trailing '/' and the path is not "/", so delete it and restart the
+    ; while process.
+    xor a
+    ld (de), a
+    jr dirname
+_:
+    ; Delete the slash and return the start of the string
+    xor a
+    ld (de), a
+    ld d, h \ ld c, l
+_dirname_root:
+    ret
+
+_dirname_cur:
+    ; If there is no '/', return ".", which is static process data.
+    ex de, hl
+    lld hl, _dirname_dot
+    ld (hl), '/'
+    inc hl
+    ld (hl), 0
+    dec hl
+    ex de, hl
+    ret
+; }}}
+
