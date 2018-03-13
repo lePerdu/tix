@@ -41,5 +41,33 @@ S_ISUID .equ %0000100000000000
 S_ISGID .equ %0000010000000000
 S_ISVTX .equ %0000001000000000
 
+
+;; Structure for returning data from *stat()
+;   dev - ID of the device containing the file. (This is always 0 for now)
+;   inode - Inode of the file
+;   mode - File mode (type and permissions)
+;   size - File size (only counting data, not the header)
+;   uid - UID of the file owner
+;   gid - GID of the file owner
+;   nlink - Number of hard links to the file
+;   ; atime,mtime,ctime - Access, modification, and status change times of the
+;       file
+;   rdev - Device ID (for character and block special files)
+;   blksize - Filesystem block size (always 1 for now)
+;   block - Number of blocks the file uses (the physical size of the file)
+;
+stat_dev    .equ 0
+stat_inode  .equ 2
+stat_mode   .equ 4
+stat_size   .equ 6
+stat_uid    .equ 8
+stat_gid    .equ 9
+stat_nlink  .equ 10
+stat_rdev   .equ 11
+stat_blksize    .equ 13
+stat_blocks .equ 15
+
+sizeof_stat .equ 17
+
 #endif ; STAT_INC_
 

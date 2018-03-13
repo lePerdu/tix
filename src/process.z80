@@ -390,16 +390,15 @@ proc_ctx_switch: ; {{{
 ;; Locations in kernel_tmp to store various things during process creation
 ; Kernel RAM must be mapped to use these.
 proc_create_sp_save     .equ kernel_tmp + 0
+proc_create_argv        .equ kernel_tmp + 2
+proc_create_argv_size   .equ kernel_tmp + 4 ; Total size of arguments
+proc_create_argc        .equ kernel_tmp + 6 ; Number of arguments
+proc_create_envp        .equ kernel_tmp + 8
+proc_create_envp_size   .equ kernel_tmp + 10
+proc_create_envp_count  .equ kernel_tmp + 12
 ; Page of arguments and environment (both in program data)
-proc_create_name        .equ kernel_tmp + 2
-proc_create_envp        .equ kernel_tmp + 5
-proc_create_arg_page    .equ kernel_tmp + 4
-proc_create_envp_size   .equ kernel_tmp + 7
-proc_create_envp_count  .equ kernel_tmp + 9
-proc_create_argv        .equ kernel_tmp + 11
-proc_create_argv_size   .equ kernel_tmp + 13 ; Total size of arguments
-proc_create_argc        .equ kernel_tmp + 15 ; Number of arguments
-proc_create_tixe_header .equ kernel_tmp + 19
+proc_create_arg_page    .equ kernel_tmp + 14
+proc_create_tixe_header .equ kernel_tmp + 15
 proc_create_tmp_stack   .equ kernel_tmp_end
 
 
@@ -421,8 +420,8 @@ proc_get_arg_size_: ; {{{
 
     ld bc, 0
     ld de, 0
-    push de
 _proc_get_env_size_loop:
+    push de
         inc bc \ inc bc ; Pointer
         ld e, (hl)
         inc hl
@@ -431,6 +430,7 @@ _proc_get_env_size_loop:
         ld a, d
         or e
         jr z, _
+
         ex de, hl
         push bc
             res 7, h
@@ -442,8 +442,7 @@ _proc_get_env_size_loop:
         ex de, hl
     pop de
     inc de
-    push de
-        jr _proc_get_env_size_loop
+    jr _proc_get_env_size_loop
 
 _:
     pop de
@@ -770,46 +769,64 @@ proc_init_data_: ; {{{
     ld (proc_create_sp_save), sp
     ld sp, hl
 
-    ; Copy environment and arguments
+    ; Copy arguments and environment
 
     ld e, (iy + proc_ent_data_addr)
     ld d, (iy + proc_ent_data_addr+1)
 
-    push de ; Save the starting argv address for later
-        ; Reserve space for the executable name (the address isn't known until after
-        ; the arguments are copied)
-        inc de \ inc de
-
-        ld hl, (proc_create_argv)
-        call proc_arg_copy_
-    pop hl
+    ld hl, (proc_create_argv)
+    call proc_arg_copy_
     ; (de) = top of data section
-    ; (hl) = start of argv
-
-    ; Write the executable name to the first element of the argv array
-    ld (hl), e
-    inc hl
-    ld (hl), d
-    ; Copy the name to after the array
-    ld hl, (proc_create_name)
-    call strcpy
 
     push de
         ld hl, (proc_create_envp)
         call proc_arg_copy_
     pop hl
     ex de, hl
-    ; (de) = environment
+    ; (de) = environment start
     ; (hl) = new top of data section
 
-    ; proc_os_data_environ = 0
+    xor a
+
+    ; optarg
+    ld (hl), a
+    inc hl
+    ld (hl), a
+    inc hl
+    ; optind = 1
+    ld (hl), 1
+    inc hl
+    ld (hl), a
+    inc hl
+    ; opterr
+    ld (hl), 1
+    inc hl
+    ld (hl), a
+    inc hl
+    ; optopt
+    ld (hl), a
+    inc hl
+    ld (hl), a
+    inc hl
+    ; _optoptind
+    ld (hl), a
+    inc hl
+    ld (hl), a
+    inc hl
+
+    ; _dirname_dot
+    ld (hl), '.'
+    inc hl
+    ld (hl), a
+    inc hl
+
+    ; environ
     ld (hl), e
     inc hl
     ld (hl), d
     inc hl
 
-    ; proc_os_data_errno = 2
-    xor a
+    ; errno
     ld (hl), a
     inc hl
     ld (hl), a
@@ -834,7 +851,8 @@ proc_init_data_: ; {{{
         ldir
     pop de ; new environ
 
-    ; TODO Write this to environ in the first place
+    ; TODO Write this to environ in the first place (but still copy the strings
+    ; statically (?))
     ld l, (iy + proc_ent_prog_data_addr)
     ld h, (iy + proc_ent_prog_data_addr+1)
     ; environ = -4
@@ -975,7 +993,6 @@ execve: ; {{{
         push hl
             push de
                 push ix \ pop de
-                ld (proc_create_name), de
 
                 push de
                     call resolve_path
@@ -1077,18 +1094,8 @@ _execve_found_file:
             ld (proc_create_envp), de
 
             call proc_get_arg_size_ ; argv
-            ; Also include the executable name
-            inc de
+            ld (proc_create_argv_size), bc
             ld (proc_create_argc), de
-
-            push bc
-                ld hl, (proc_create_name)
-                call strlen
-                ; Also allocate for null byte and pointer
-                inc bc \ inc bc \ inc bc
-            pop hl
-            add hl, bc
-            ld (proc_create_argv_size), hl
 
             ld hl, (proc_create_envp)
             call proc_get_arg_size_ ; env

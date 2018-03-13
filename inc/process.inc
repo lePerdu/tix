@@ -92,16 +92,22 @@ DEFINE_OR_MASK(PROC_TERMINATED, 7)
 ;; Structure for process data stored in a process's data section.
 ; These are generally accessed relative to the prog_data_addr with negative
 ; offsets.
-;   errno - Errno value for the process.
-;   environ - Pointer to the environment.
+;   optarg, optind, opterr, optopt, _optoptind - Used by getopt().
 ;   dirname_dot - Static string to be returned by dirname when the directory is
 ;       "." (current working directory).
+;   environ - Pointer to the environment.
+;   errno - Errno value for the process.
 ;
-proc_os_data_dirname_dot    .equ 0
-proc_os_data_environ        .equ 2
-proc_os_data_errno          .equ 4
+proc_os_data_optarg         .equ 0
+proc_os_data_optind         .equ 2
+proc_os_data_opterr         .equ 4
+proc_os_data_optopt         .equ 6
+proc_os_data_optoptind      .equ 8
+proc_os_data_dirname_dot    .equ 10
+proc_os_data_environ        .equ 12
+proc_os_data_errno          .equ 14
 
-sizeof_proc_os_data .equ 6
+sizeof_proc_os_data .equ 16
 
 ;; Structure for executable file format (TIXE) header
 ;   32  tixeh_magic - Magic string "TIXE".
