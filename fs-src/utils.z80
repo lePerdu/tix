@@ -3,9 +3,13 @@
 ;
 ; String functions.
 ;
-; This is copied from src/string.z80 for use with userspace programs.
+; This is copied from src/utils.z80 for use with userspace programs.
 ;
 
+#ifndef UTILS_Z80_
+#define UTILS_Z80_
+
+#include "utils.inc"
 #include "errno.inc"
 
 ;; Finds the length of a string.
@@ -53,6 +57,7 @@ strnlen: ; {{{
     ld a, b
     or c
     ret z
+
     ld d, b \ ld e, c
     xor a
     cpir
@@ -135,6 +140,10 @@ stpcpy: ; {{{
 ;   de, ix, iy
 ;
 strncpy: ; {{{
+    ld a, b
+    or c
+    ret z
+
     push de
         xor a
 _:
@@ -178,6 +187,10 @@ _:
 ;   ix, iy
 ;
 stpncpy: ; {{{
+    ld a, b
+    or c
+    ret z
+
     xor a
 _:
     cp (hl)
@@ -245,9 +258,6 @@ _strcmp_eq:
 
 ; }}}
 
-; Localesa are not currently supported
-strcoll .equ strcmp
-
 
 ;; Compares the first portions of two strings.
 ; Parameters:
@@ -286,6 +296,11 @@ _strncmp_ne:
     ; z is not set since we only jump here if the strings are not equal.
 
 ; }}}
+
+
+; Locales are not currently supported
+strcoll .equ strcmp
+strncoll .equ strncmp
 
 
 ;; Finds the first occurance of a character in a string.
@@ -333,23 +348,24 @@ strrchr: ; {{{
     ld bc, 0
     cpir
     dec hl
+    ; (hl) = null byte
+    ; bc = - (len + 1)
 
     ; TODO Is it faster to use a loop and not negate bc?
-    ; Negate and decrement bc
+    ; Negate bc
     ld a, b
     cpl
     ld b, a
     ld a, c
     cpl
     ld c, a
-    ; inc bc
-    ; dec bc
+    inc bc
 
     ld a, e
     cpdr
+    inc hl
     jr nz, _ ; Not found
     ld d, h \ ld e, l
-    inc de
     ;or a
     sbc hl, bc ; Restore hl
     ;or a
@@ -424,8 +440,8 @@ strdup: ; {{{
             syscall malloc_
         pop bc
         jr c, _
+        ld d, h \ ld e, l
         ex (sp), hl
-        ex de, hl
         ; (de) = (sp) = allocation
         ; (hl) = string
         ; bc = length
@@ -611,18 +627,21 @@ basename: ; {{{
     ld a, (de)
     dec de
     or a
-    jr nz, _
-    ; If at a trailing slash, see if at the beginning of the string
+    jr z, _basename_trailing
+    ; Not a trailing slash, so move over it
+    inc de ; Move past '/'
+    ret
+
+_basename_trailing:
+    ; If there is a trailing slash at the start of the string, it is "/", so
+    ; return
     sbc hl, de
     add hl, de ; z not affected
-    jr z, _
-    ; Have trailing '/' and the path is not "/", so delete it and restart the
-    ; while process.
+    ret z
+    ; Remove the trailing slash and start over
     xor a
     ld (de), a
     jr basename
-_:
-    ret
 
 _basename_already:
     ; If there is no '/', return the original string
@@ -665,7 +684,7 @@ _:
     ; Delete the slash and return the start of the string
     xor a
     ld (de), a
-    ld d, h \ ld c, l
+    ld d, h \ ld e, l
 _dirname_root:
     ret
 
@@ -673,11 +692,365 @@ _dirname_cur:
     ; If there is no '/', return ".", which is static process data.
     ex de, hl
     lld hl, _dirname_dot
-    ld (hl), '/'
+    ld (hl), '.'
     inc hl
     ld (hl), 0
     dec hl
     ex de, hl
     ret
 ; }}}
+
+
+;; Parses command line options
+;
+; Parameters:
+;   bc - Number of arguments (argc passed to main()).
+;   (iy) - Argument array (argv passed to main()).
+;   (de) - String specifying valid option characters. A character should be
+;       followed by a colon if the option takes an argument.
+;   opterr - non-0 to print diagnostic messages to standard error on invalid
+;       arguments (the first character of the option string also has to not be
+;       ':' for messages to be printed).
+;
+; Return:
+;   a - Character of the option if one is found; -1 if there are no more
+;       options; '?' if an option not specified in the options tring is found or
+;       an option which takes an argument is found without an argument and ':'
+;       is not the first character of the option string; ':' if there is a
+;       missing argument and ':' is the first character of the option string.
+;   optopt - Character which caused an error.
+;   optind - Index of the next option/argument in argv.
+;   optarg - Argument of the option, if one is requried and found.
+;
+; Preserves:
+;   ix
+;
+getopt: ; {{{
+    lld hl, (optind)
+    or a
+    sbc hl, bc
+    ljp nc, _getopt_no_opt
+
+    add hl, bc ; Restore to (optind)
+    ex de, hl
+    ; de = (optind)
+    ; (hl) = option string
+    ; Each element is 2-bytes
+    add iy, de
+    add iy, de
+    ex de, hl
+    ; (de) = option string
+
+    ; (hl) = argument
+    ld l, (iy)
+    ld h, (iy+1)
+
+    ; TODO Check if hl is null pointer?
+
+    ; First  character must be '-'
+    ld a, (hl)
+    cp '-'
+    ljp nz, _getopt_no_opt
+
+    inc hl
+    ld a, (hl)
+    or a
+    ljp z, _getopt_no_opt ; arg is "-"
+
+    ; If arg == "--", increment optind and return -1
+    cp '-'
+    jr nz, _getopt_is_opt
+    inc hl
+    ld a, (hl)
+    or a
+    ljp z, _getopt_no_opt_inc_ind
+
+    ; For any other string starting with "--", treat '-' as an invalid option
+    dec hl ; Back to the second '-'
+    ljp _getopt_inval_opt
+
+_getopt_is_opt:
+    ; (hl) = option character
+    ; Add in the option index for "-abc" syntax
+    lld a, (_optoptind)
+    inc a
+    lld (_optoptind), a
+    dec a
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    ld a, (hl)
+
+    ; (de) = option string
+    ; TODO Do error checking on the option string?
+    ex de, hl
+    push bc
+        lcall strchr
+    pop bc
+    ex de, hl
+    ljp c, _getopt_inval_opt
+    ; (hl) = option character in the option string
+
+    ; (hl) has the option character, so a can be used
+    inc hl
+    ld a, (hl)
+    dec hl
+    cp ':'
+    jr nz, _getopt_found ; No argument required
+
+    ; See if the argument is just the option
+    ld l, (iy + 0)
+    ld h, (iy + 1)
+    ; Move to current option
+    lld a, (_optoptind)
+    ; dec a \ inc a ; Use old value but also move over the '-' and option
+    inc a
+    add a, l
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    ld a, (hl)
+    dec hl
+    or a
+    ld a, (hl) ; Get option character (needed for either case)
+    jr z, _getopt_arg_next_arg ; Option argument is not in the same string
+
+    ; Option argument is immediately after the option in the current argument
+    inc hl
+    lld (optarg), hl
+
+    lld hl, (optind)
+    inc hl
+    lld (optind), hl
+
+    ; Reset optoptind after argument option
+    ld l, a
+    xor a
+    lld (_optoptind), a
+    ld a, l
+    ; Carry reset from xor
+    ret
+
+_getopt_arg_next_arg:
+    ; a = option character
+    ; Make sure there there is an available argument
+    lld hl, (optind)
+    inc hl
+    or a
+    sbc hl, bc
+    jr nc, _getopt_no_arg
+
+    ; Return with the next argument in optarg
+    adc hl, bc ; Restore hl and increment (carry is set from sbc)
+    lld (optind), hl
+    ld l, (iy + 2)
+    ld h, (iy + 3)
+    lld (optarg), hl
+
+    ; Reset optoptind after argument option
+    ld l, a
+    xor a
+    lld (_optoptind), a
+    ld a, l
+    ; Carry reset from xor
+    ret
+
+_getopt_found:
+    ld a, (hl) ; Get the option
+    push af
+        ; If at the end of the argument, go to the next argument.
+        ld h, (iy + 1)
+        lld a, (_optoptind)
+        add a, (iy + 0)
+        inc a ; Move over '-'
+        ld l, a
+        jr nc, _
+        inc h
+_:
+        ld a, (hl)
+        or a
+        jr nz, _
+        lld (_optoptind), a
+        lld hl, (optind)
+        inc hl
+        lld (optind), hl
+_:
+    pop af
+    or a
+    ret
+
+_getopt_no_arg:
+    ; a = option character
+    ld h, 0
+    ld l, a
+    lld (optopt), hl
+    lld hl, (optind)
+    inc hl
+    lld (optind), hl
+    ; Reset optoptind after argument option
+    xor a
+    lld (_optoptind), a
+    ; Print an error message if opterr is non-0 and the option string does not
+    ; start with ':'
+    ; Also, return ':' if the option starts with ':'
+    ld a, (de)
+    cp ':'
+    jr z, _
+
+    lld bc, (opterr)
+    ld a, b
+    or c
+    jr z, _
+
+    ; Subtract optind to get back to the first argument (program name)
+    lld bc, (optind)
+    dec bc ; Was incremented above
+    push iy \ pop hl
+    sla c \ rl b
+    or a
+    sbc hl, bc
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    lcall strlen
+    push hl \ pop iy
+    ld a, STDERR_FILENO
+    syscall write_
+
+    lld hl, _getopt_no_arg_str
+    lcall strdup
+    push hl \ pop iy \ push hl
+        ld bc, _getopt_no_arg_str_len
+        ld a, STDERR_FILENO
+        syscall write_
+    pop hl
+    syscall free_
+
+    lld iy, optopt
+    ld bc, 1
+    ld a, STDERR_FILENO
+    syscall write_
+
+    ld a, '\n'
+    push af ; Put '\n' on the stack to write it
+        ld iy, 1
+        add iy, sp
+        ld bc, 1
+        ld a, STDERR_FILENO
+        syscall write_
+    pop af
+
+    ld a, '?'
+_:
+    scf
+    ret
+
+_getopt_inval_opt:
+    ; a = option character
+    ld h, 0
+    ld l, a
+    lld (optopt), hl
+
+    ; Print an error message if opterr is non-0 and the option string does not
+    ; start with ':'
+    ld a, (de)
+    cp ':'
+    jr z, _
+    lld bc, (opterr)
+    ld a, b
+    or c
+    jr z, _
+
+    push iy
+        ; Subtract optind to get back to the first argument (program name)
+        lld bc, (optind)
+    pop hl \ push hl
+        sla c \ rl b
+        or a
+        sbc hl, bc
+        ld a, (hl)
+        inc hl
+        ld h, (hl)
+        ld l, a
+        lcall strlen
+        push hl \ pop iy
+        ld a, STDERR_FILENO
+        syscall write_
+
+        ; Have to copy this to the data section in order to write it since
+        ; write() may use bank A.
+        ; TODO Find a way to allow data to be copied from the text section or
+        ; document this
+        lld hl, _getopt_no_opt_str
+        lcall strdup
+        push hl \ pop iy \ push hl
+            ld bc, _getopt_no_opt_str_len
+            ld a, STDERR_FILENO
+            syscall write_
+        pop hl
+        syscall free_
+
+        lld iy, optopt
+        ld bc, 1
+        ld a, STDERR_FILENO
+        syscall write_
+
+        ld a, '\n'
+        push af ; Put '\n' on the stack to write it
+            ld iy, 1
+            add iy, sp
+            ld bc, 1
+            ld a, STDERR_FILENO
+            syscall write_
+        pop af
+    pop iy
+_:
+
+    ; Increment optind/optoptind even after invalid option.
+    ; If at the end of the argument, go to the next argument.
+    ld h, (iy + 1)
+    lld a, (_optoptind)
+    add a, (iy + 0)
+    inc a ; Move over '-'
+    ld l, a
+    jr nc, _
+    inc h
+_:
+    ld a, (hl)
+    or a
+    jr nz, _
+    lld (_optoptind), a
+    lld hl, (optind)
+    inc hl
+    lld (optind), hl
+_:
+    ld a, '?'
+    scf
+    ret
+
+_getopt_no_opt_inc_ind:
+    lld hl, (optind)
+    inc hl
+    lld (optind), hl
+    ; Can leave optoptind alone since it should be 0 anyway
+_getopt_no_opt:
+    ld a, -1
+    scf
+    ret
+
+_getopt_no_opt_str:
+    .db ":inval opt:",0
+_getopt_no_opt_str_len .equ $ - _getopt_no_opt_str
+
+_getopt_no_arg_str:
+    .db ":opt arg required:",0
+_getopt_no_arg_str_len .equ $ - _getopt_no_arg_str
+
+; }}}
+
+#endif
 
