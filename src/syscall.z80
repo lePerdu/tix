@@ -229,13 +229,19 @@ _syscall_return:
 
 ;; Adjust offsets for process-local calls/jumps/loads.
 ; These borrow an idea from KnightOS to make process code position-independent.
-; Depending on whether the literal value following this is in bank A or C, the
-; location of the text or program data section will be added to it (after
-; treating the value as relative to the start of its page. After execution, it
-; will modify the address to reflect the actual address, making the code
-; position-dependent for its current location. It also replaces the restart
-; which triggered it with a nop instruction so that the adjustment only made the
-; first time the code is executed.
+; Depending on the value of the address following this, location of the text or
+; program data section will be added to it (after treating the value as relative
+; to the start of its page. If the value is in bank A, it will be treated as a
+; text section address. If it is in bank B, it will be treated as a data section
+; address. If it is in either other bank, it will be added directly to the data
+; section (and not relocated to the start of its mapping bank first); this is to
+; allow for negative offsets to be used to access OS-allocated data (such as
+; errno).
+;
+; After execution, it will modify the address to reflect the actual address,
+; making the code position-dependent for its current location. It also replaces
+; the restart which triggered it with a nop instruction so that the adjustment
+; only made the first time the code is executed.
 ;
 ; If this is executed from ROM, it will have no effect (and so would not work).
 ;
@@ -282,17 +288,23 @@ _:
         ex de, hl
         ; (de) = value address
 
-        ; Bank A has the upper bits 01, bank C has 11, we want 00
-        res 6, b
-        bit 7, b
-        jr nz, _lld_data
-_lld_text:
-        ld a, proc_ent_text_addr
-        jr _
+        ; Test the upper 2 bits to find out how to interpret the value.
+        ld a, b
+        and %11000000
+        cp %01000000 ; Bank A
+        jr z, _lld_text
+        cp %10000000 ; Bank B
+        jr nz, _lld_abs ; Not bank A or B
 
 _lld_data:
         res 7, b
+_lld_abs:
         ld a, proc_ent_prog_data_addr
+        jr _
+
+_lld_text:
+        res 6, b
+        ld a, proc_ent_text_addr
         ; jr _
 
 _:

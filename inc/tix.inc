@@ -8,9 +8,8 @@
 #define TIX_INC_
 
 ;; Addresses for the text and data sections.
-; TODO Make macros for starting/ending each section
 tixe_text_org .equ $4000
-tixe_data_org .equ $C000
+tixe_data_org .equ $8000
 
 ;; Macros for starting and ending sections.
 ; The string "text" or "data" should be passed as parameters.
