@@ -6,7 +6,7 @@ FS_SRC = fs-src
 FS = fs
 
 FS_BINS := $(addprefix $(FS)/bin/, init echo pwd ls cat link unlink rmdir \
-	rm mv basename dirname)
+	rm mv basename dirname fnmatch glob)
 
 $(FS): $(FS_BINS)
 	@touch $@
@@ -26,6 +26,8 @@ $(FS)/bin/mv: $(FS_SRC)/mv.z80 $(FS_SRC)/utils.z80
 $(FS)/bin/rm: $(FS_SRC)/rm.z80 $(FS_SRC)/utils.z80
 $(FS)/bin/dirname: $(FS_SRC)/dirname.z80 $(FS_SRC)/utils.z80
 $(FS)/bin/basename: $(FS_SRC)/basename.z80 $(FS_SRC)/utils.z80
+$(FS)/bin/fnmatch: $(FS_SRC)/fnmatch.z80 $(FS_SRC)/utils.z80 $(FS_SRC)/pattern.z80
+$(FS)/bin/glob: $(FS_SRC)/glob.z80 $(FS_SRC)/utils.z80 $(FS_SRC)/pattern.z80
 
 $(FS_BINS): | $(FS)/bin
 	$(SPASM) $(SPASMOPTS) $< $@

@@ -1,0 +1,85 @@
+;
+; fnmatch.z80
+;
+; Test utility for fnmatch()
+;
+
+.nolist
+#include "tix.inc"
+#include "unistd.inc"
+.list
+
+.org $0000
+.db "TIXE"
+.dw $400
+.dw $100
+.dw text
+.dw text_end - text
+.dw data
+.dw data_end - data
+
+text:
+tixe_sec_start("text")
+
+    ; int main(int argc, char *argv[]);
+    pop de
+    pop bc
+    pop hl
+    push hl
+    push bc
+    push de
+
+    ld a, c
+    cp 3
+    jr nz, done
+    ld a, b
+    or a
+    jr nz, done
+
+    inc hl \ inc hl
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    inc hl
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+
+    ld bc, FNM_PERIOD | FNM_PATHNAME
+    lcall fnmatch
+
+    jr c, _
+    lld iy, matched_str
+    ld bc, match_str_len
+    jr ++_
+_:
+    lld iy, not_matched_str
+    ld bc, not_match_str_len
+_:
+    ld a, STDOUT_FILENO
+    syscall write_
+
+done:
+    ld hl, 0
+    ret
+
+#include "fs-src/utils.z80"
+#include "fs-src/pattern.z80"
+
+tixe_sec_end()
+text_end:
+
+data:
+tixe_sec_start("data")
+
+matched_str:
+    .db "Matched\n",0
+match_str_len .equ $ - matched_str
+
+not_matched_str:
+    .db "Not matched\n",0
+not_match_str_len .equ $ - not_matched_str
+
+tixe_sec_end()
+data_end:

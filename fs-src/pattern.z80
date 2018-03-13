@@ -1,0 +1,1022 @@
+;
+; pattern.z80
+;
+; Shell pattern matching functions
+;
+
+#ifndef PATTERN_Z80_
+#define PATTERN_Z80_
+
+#include "dirent.inc"
+#include "stat.inc"
+#include "tix.inc"
+#include "utils.inc"
+#include "fs-src/utils.z80"
+
+;; fnmatch() flags
+
+DEFINE_OR_MASK(FNM_PATHNAME,    1)
+DEFINE_OR_MASK(FNM_PERIOD,      2)
+DEFINE_OR_MASK(FNM_NOESCAPE,    3)
+DEFINE_OR_MASK(FNM_NOSYS,       4)
+
+;; First character in the path portion (for internal use)
+DEFINE_OR_MASK(FNM_FIRST,       5)
+;; Act as if the pattern string ends at the first '/'.
+; This is for internal use in glob() so that it can use each portion of the
+; pattern separately without copying and null-terminating them. Without this,
+; glob() would have to copy the whole pattern string (worst/usual-case).
+;
+; This flag also sets FNM_PATHNAME (as it doesn't make sense without it)
+BIT_FNM_SINGLE  .equ 6
+FNM_SINGLE  .equ (1 << BIT_FNM_SINGLE) | FNM_PATHNAME
+
+FNM_NOMATCH     .equ 1
+
+;; Glob structure
+;   pathc - Number of paths matched.
+;   pathv - Array of matched pathnames.
+;   offs - Number of elements to reserve (and fill with 0) at the beginning of
+;       pathv. (Not really s)
+;
+gl_pathc  .equ 0
+gl_pathv  .equ 2
+gl_offs   .equ 4
+
+sizeof_glob .equ 6
+
+;; Glob flags
+
+DEFINE_OR_MASK(GLOB_APPEND,     0)
+DEFINE_OR_MASK(GLOB_DOOFFS,     1)
+DEFINE_OR_MASK(GLOB_ERR,        2)
+DEFINE_OR_MASK(GLOB_MARK,       3)
+DEFINE_OR_MASK(GLOB_NOCHECK,    4)
+DEFINE_OR_MASK(GLOB_NOESCAPE,   5)
+DEFINE_OR_MASK(GLOB_NOSORT,     6)
+
+GLOB_NOMATCH .equ 1
+GLOB_ABORTED .equ 2
+GLOB_NOSPACE .equ 3
+
+;; Matches filenames/pathnames
+; Parameters:
+;   (de) - Pattern to use. This is a glob-style pattern (using *, ?, and [...]).
+;   (hl) - File/path name to match.
+;   [b]c - Matching flags, composed of FNM_* flags.
+; Return:
+;   c flag - Reset if the name is matched, set if not.
+;   a - 0 if there is a match; FNM_NOMATCH if there no match; something else if
+;   there is an error.
+; Preserves:
+;   ix, iy
+;
+; TODO Support ranges and character classes
+;
+fnmatch: ; {{{
+
+    ld b, c ; strchr() uses c but not b
+    bit BIT_FNM_PERIOD, b
+    jr z, _
+    set BIT_FNM_FIRST, b
+    jr ++_
+_:
+    res BIT_FNM_FIRST, b
+_:
+
+_fnmatch_loop:
+    ; See if the first character in a segment is '.' (only if FNM_PERIOD is set)
+    bit BIT_FNM_FIRST, b
+    jr z, _
+    ; Not the first character any more
+    res BIT_FNM_FIRST, b
+    ld a, (hl)
+    cp '.'
+    jr nz, _
+    lcall _fnmatch_tok
+    ; Don't care about escaping
+    cp '.'
+    ljp nz, _fnmatch_nomatch
+    inc hl
+    jr _fnmatch_loop
+_:
+
+    lcall _fnmatch_tok
+    jr z, _fnmatch_exact
+
+    ; Match against '*' before '/' so that it can match against an empty string
+    ; (it checks for '/'s later)
+    cp '*'
+    jr z, _fnmatch_ast
+
+    ; '/' in string has to be matched exactly
+    bit BIT_FNM_PATHNAME, b
+    jr z, _
+    ld c, a ; Save pattern character
+    ld a, (hl)
+    cp '/'
+    ld a, c ; Needed in either case
+    jr z, _fnmatch_slash
+_:
+
+    cp '?'
+    jr z, _fnmatch_quest
+    cp '['
+    jr z, _fnmatch_bracket
+
+_fnmatch_exact:
+    cp (hl)
+    ljp nz, _fnmatch_nomatch
+    or a
+    ; If at the end, it matched
+    ret z ; a = 0, nc
+
+_fnmatch_quest: ; Just move to the next character
+    inc hl
+
+    jr _fnmatch_loop
+
+_fnmatch_slash:
+    ; Has to match exactly in the pattern (character in a)
+    cp '/'
+    jr nz, _fnmatch_nomatch
+
+    ; Stop if FNM_SINGLE is set
+    bit BIT_FNM_SINGLE, b
+    ; Carry reset from equal cp (preserved by bit)
+    ret nz
+
+    inc hl
+
+    ; Set FIRST flag if PERIOD is set
+    bit BIT_FNM_PERIOD, b
+    jr z, _fnmatch_loop
+    set BIT_FNM_FIRST, b
+    jr _fnmatch_loop
+
+_fnmatch_ast:
+    ; This has to match patterns even when the character/item(s) immediately
+    ; after the asterisk may match in multiple positions. It may also have to do
+    ; this for multiple asterisks in the pattern. As far as I can tell,
+    ; recursion is the only way to do this.
+
+    ; If the asterisk is at the end of the stirng, it always matches
+    push de ; Just peek at the next character
+        lcall _fnmatch_tok
+    pop de
+    or a
+    ret z ; Returns with a = 0 and nc
+
+    ; Also if the asterisk is at the end of the part and FNM_SINGLE is set
+    cp '/'
+    jr nz, _
+    ; Stop if FNM_SINGLE is set
+    bit BIT_FNM_SINGLE, b
+    ; Carry reset from equal cp (preserved by bit)
+    ret nz
+_:
+
+_fnmatch_ast_recur:
+    push bc
+    push de
+    push hl
+        lcall fnmatch
+    pop hl
+    pop de
+    pop bc
+    ret nc
+
+    ; If the match failed because of an error, return the error
+    cp FNM_NOMATCH
+    scf
+    ret nz
+
+    ; If not matched, go to the next character in the filename and try again
+    ld a, (hl)
+    inc hl
+
+    ; If PATHNAME is set, next char is '/', and the previous match failed, the
+    ; next char in the pattern also has to be '/'
+    bit BIT_FNM_PATHNAME, b
+    jr z, _fnmatch_ast_recur
+    cp '/'
+    jr nz, _fnmatch_ast_recur
+
+    ; Next pattern character has to bc '/'
+    lcall _fnmatch_tok
+    cp '/'
+    jr nz, _fnmatch_nomatch
+
+    ; FNM_SINGLE was checked at the start, so there is no need to check it here
+
+    ; If the '/'s line up, continue like normal
+    ljp _fnmatch_loop
+
+_fnmatch_bracket:
+    ld c, (hl) ; Cache the character to match
+
+    ; At this point, we know that the bracket was unescaped and the bracket
+    ; expression is completed.
+    lcall _fnmatch_tok
+    ; TODO Are characters escaped inside bracket expressions?
+    jr z, _fnmatch_bracket_loop ; Escaped '!'
+    cp '!'
+    jr z, _fnmatch_bracket_cpl
+
+_fnmatch_bracket_loop:
+    ; Compare first so that ']' can be the first character in the bracket
+    ; expression
+    cp c
+    jr z, _fnmatch_bracket_matched
+    lcall _fnmatch_tok
+    jr z, _fnmatch_bracket_loop ; Always continue if escaped
+    cp ']'
+    jr nz, _fnmatch_bracket_loop
+    jr _fnmatch_nomatch
+
+_fnmatch_bracket_matched:
+    ; Scan to the ending bracket
+    lcall _fnmatch_tok
+    jr z, _fnmatch_bracket_matched ; Continue scanning if escaped
+    cp ']'
+    jr nz, _fnmatch_bracket_matched
+
+    ; Continue the matching
+    inc hl
+    ljp _fnmatch_loop
+
+_fnmatch_bracket_cpl:
+    lcall _fnmatch_tok
+_fnmatch_bracket_cpl_loop:
+    ; Compare first so that ']' can be the first character in the bracket
+    ; expression
+    cp c
+    jr z, _fnmatch_nomatch
+    lcall _fnmatch_tok
+    jr z, _fnmatch_bracket_cpl_loop ; Always continue if escaped
+    cp ']'
+    jr nz, _fnmatch_bracket_cpl_loop
+    ; Continue the matching
+    inc hl
+    ljp _fnmatch_loop
+
+_fnmatch_nomatch:
+    ld a, FNM_NOMATCH
+    scf
+    ret
+
+_fnmatch_error:
+    ld a, -1
+    scf
+    ret
+
+
+;; Pattern tokenizer for fnmatch()
+; This is made into a separate function so that it can be used during normal
+; matching and in bracket expansions.
+;
+; Parameters:
+;   (de) - Current character of pattern.
+; Return:
+;   a - Unescaped character.
+;   z flag - Set if a character was escaped.
+;   (de) - Next character of the pattern.
+; Preserves:
+;   bc, hl, ix, iy
+;
+_fnmatch_tok:
+    ld a, (de)
+    inc de
+    cp '\\'
+    jr nz, _fnmatch_tok_noesc
+
+    bit BIT_FNM_NOESCAPE, b
+    jr nz, _fnmatch_tok_noesc
+
+    ld a, (de)
+    inc de
+    or a
+    jr nz, _
+    ; If it is a '\' at the end of the string, return it as unescaped
+    ld a, '\\'
+    or a ; Reset z
+    ret
+_:
+    cp a ; Set z
+    ret
+
+_fnmatch_tok_noesc:
+
+    ; For '[', we have to look ahead to find out if the bracket is closed. If
+    ; not, bracket expansion will not take place, so the escaped flag is set.
+    cp '['
+    ret nz
+
+    push de
+        ; Don't check first character as ']' (also not after '!')
+        ld a, (de)
+        cp '!'
+        jr nz, _
+        inc de
+        ld a, (de)
+_:
+_fnmatch_tok_bracket_search:
+        ; Check for null or '/' is done before incrementing to work better with
+        ; escaping and the loop entrace
+
+        ; End of string/part found before closing ']'
+        or a
+        jr z, _fnmatch_tok_esc_bracket
+        cp '/'
+        jr nz, _
+        bit BIT_FNM_PATHNAME, b
+        jr nz, _fnmatch_tok_esc_bracket
+_:
+
+        inc de
+        ld a, (de)
+        cp '\\'
+        jr nz, _
+        inc de
+        ld a, (de)
+        jr _fnmatch_tok_bracket_search
+_:
+        cp ']'
+        jr nz, _fnmatch_tok_bracket_search
+
+        ; Closing bracket is found
+_fnmatch_tok_bracket:
+    pop de
+    ld a, '['
+    or a
+    ret
+
+_fnmatch_tok_esc_bracket:
+    pop de
+    ld a, '['
+    cp a
+    ret
+
+; }}}
+
+
+;; Matches existing filenames.
+; This uses a lot of memory (on the stack) because it uses recursion and
+; incrementally builds the path strings on the stack (doing so on the heap is
+; also possible but slower).
+;
+; Parameters:
+;   (de) - Pattern to match.
+;   [b]c - Flags (OR of GLOB_* flags).
+;   (ix) - Error callback.
+;   (iy) - Glob structure in which to store the data.
+; Return:
+;   c flag - Reset if the pattern matched at least 1 file, set if not or there
+;       is a syntax/io/permission error.
+;   a - 0 if there is a match; GLOB_ABORTED, GLOB_NOMATCH, or GLOB_NOSPACE for
+;       various errors.
+;
+glob: ; {{{
+    ; There are a bunch of buffers, sizes, strings, etc. to keep track of (too
+    ; many to just keep them in registers and using push/pop), so some space is
+    ; reserved on the stack to be used, pointed to by ix. ix also doubles as a
+    ; frame pointer so that it is possible to exit on error even when multiple,
+    ; recursive calls deep.
+
+    ; glob structure
+#define _pglob -2
+    push iy
+    ; Error function
+#define _errfunc -4
+    push ix
+    ; Flags (only the LSB)
+#define _flags -5
+    ld b, c
+    push bc
+    inc sp
+    ; Heap-allocated buffer to build pathnames for passing to opendir() and
+    ; stat()
+#define _pathname -7
+    ; Store null so this can be "freed" if there is an error early on
+    ld hl, 0
+    push hl; Store null in case there is an error early on and
+    ; Allocated size of _pathname. This is single-byte since PATH_MAX = 256 (0
+    ; indicates size of 256)
+#define _pathname_cap -8
+    ; Enough to store first portion (including leading '/').
+    ; Null byte is not counted in this
+    ld a, NAME_MAX+1
+    push af
+    inc sp
+    ; Allocated size of the pathv array (including space reserved by offs)
+    ; TODO Should this not include offs and/or store count, not size?
+#define _pathv_cap -10
+    push hl ; Garbage
+    ; Buffer to retrieve file data from stat(). This is (nearly) always used and
+    ; never needs to span recursion calls, so it can be allocated up front
+#define _statbuf -10 - sizeof_stat
+    ld hl, -sizeof_stat
+    add hl, sp
+    ld sp, hl
+
+    ld ix, 10 + sizeof_stat
+    add ix, sp
+
+    ; Allocate the pathv buffer if GLOB_APPEND is not set
+    bit BIT_GLOB_APPEND, c
+    jr nz, _glob_append
+
+    xor a
+    ld (iy + gl_pathc), a
+    ld (iy + gl_pathc+1), a
+
+    bit BIT_GLOB_DOOFFS, c
+    ; Initial size to allocate for pathv (set after the check to preserve c)
+    ld bc, 10 ; 4 elements followed by a null
+    jr z, _
+    ld l, (iy + gl_offs)
+    ld h, (iy + gl_offs+1)
+    add hl, hl
+    add hl, bc
+    ld b, h \ ld c, l
+_:
+
+    ld (ix + _pathv_cap), c
+    ld (ix + _pathv_cap+1), b
+
+    push de
+    push iy
+        ; Use calloc to fill the offs spaces
+        ld e, 1
+        syscall calloc_
+    pop iy
+    pop de
+    jr c, _glob_nospace
+
+    ld (iy + gl_pathv), l
+    ld (iy + gl_pathv+1), h
+
+    jr _glob_alloc_pathname
+
+_glob_append:
+    ; Set _pathv_cap to pathc + offs (if applicable)
+    ; If more memory was allocated, the system will handle it with realloc()
+    ld l, (iy + gl_pathc)
+    ld h, (iy + gl_pathc+1)
+
+    bit BIT_GLOB_DOOFFS, c
+    jr z, _
+    ld c, (iy + gl_offs)
+    ld b, (iy + gl_offs+1)
+    add hl, bc
+_:
+    add hl, hl
+
+    ld (ix + _pathv_cap), l
+    ld (ix + _pathv_cap+1), h
+
+    ; jr _glob_alloc_pathname
+
+_glob_alloc_pathname:
+    ld bc, NAME_MAX+2
+    ; size was stored in _pathname_cap during initialization
+    push de
+        syscall malloc_
+    pop de
+    jr c, _glob_nospace
+
+    ld (ix + _pathname), l
+    ld (ix + _pathname+1), h
+
+    ; Set initial path to ""
+    ld (hl), 0
+
+    lcall _glob_dir
+
+    xor a
+
+    ; Frees _pathname, restores sp, and exits with the value/status in a/f
+_glob_exit:
+    push af
+        ld l, (ix + _pathname)
+        ld h, (ix + _pathname+1)
+        syscall free_
+    pop af
+    ld sp, ix
+    ret
+
+_glob_nospace:
+    ld a, GLOB_NOSPACE
+    scf
+    jr _glob_exit
+
+_glob_abort:
+    ld a, GLOB_ABORTED
+    scf
+    jr _glob_exit
+
+;; Internal function to process a directory recursively
+; Parameters:
+;   (de) - Pattern
+;   (ix) - Data initialized above
+; Return:
+;   Only returns if there is no (uncaught/critical) error
+;   (ix) - Updated data (at same location).
+;
+_glob_dir: ; {{{
+
+    ; Scan the next segment of the pattern.
+    ; If the pattern contains an un-matched bracket pair or does not contain any
+    ; special characters, the path can be resolved without searching the
+    ; directory or using fnmatch()
+    push de ; Save pattern start
+        ld c, 0 ; Set non-0 when inside bracket expression
+_glob_dir_next_seg:
+        ld a, (de)
+
+        cp '?'
+        jr z, _glob_dir_found_pat
+        cp '*'
+        jr z, _glob_dir_found_pat
+
+        ; Flag if we find a '['
+        cp '['
+        jr nz, _
+        inc c ; ld c, 1 ; set 0, c
+        ; Move past initial ']' or '!'
+        inc de
+        ld a, (de)
+
+        ; Since de is incremented next anyway, we only have to check for '!', as
+        ; a ']' will be automatically skiped over.
+        cp '!'
+        jr nz, _glob_dir_seg_end
+        inc de
+        ld a, (de)
+        jr _glob_dir_seg_end
+_:
+
+        cp ']'
+        jr nz, _
+        bit 0, c
+        ; Closing ']' found
+        jr nz, _glob_dir_found_pat
+        ; Just a lone bracket
+        jr _glob_dir_next_seg_inc
+_:
+
+        cp '\\'
+        jr nz, _
+        inc de
+        ld a, (de)
+_:
+
+_glob_dir_seg_end:
+        ; null and '/' checks are done last so that they can be jumped to from
+        ; other checks
+        or a
+        jr z, _glob_dir_found_last_seg
+        cp '/'
+        jr z, _glob_dir_found_seg
+
+_glob_dir_next_seg_inc:
+        inc de
+        jr _glob_dir_next_seg
+
+_glob_dir_found_last_seg:
+        ; (hl) = End of current pattern segment
+        ex de, hl
+    pop de ; (de) = Start
+    or a
+    sbc hl, de
+    ld b, h \ ld c, l
+
+    ; Build the path first
+    lcall _glob_append_pathname
+    push de ; Store the end of the original path to restore it later
+
+        ld e, (ix + _pathname)
+        ld d, (ix + _pathname+1)
+
+        push ix \ pop hl
+        ld bc, _statbuf
+        add hl, bc
+
+        syscall stat_
+    pop hl
+    jr nc, _
+    ld (hl), 0
+    ret
+_:
+
+    ; Add to the list
+    ljp _glob_append_pathv
+
+_glob_dir_found_seg:
+        ; (de) = End of current pattern segment
+        ld h, d \ ld l, e
+        ex (sp), hl
+        ex de, hl
+        ; (hl) = (sp) = End of current pattern segment
+        ; (de) =  Start of current segment
+        or a
+        sbc hl, de
+        ld b, h \ ld c, l
+
+        ; Append the segment to _pathname and continue
+        lcall _glob_append_pathname
+        ; TODO Verify that the path exists?
+    pop de ; Start of next pattern segment (end of current)
+    inc de ; Move past '/'
+    jr _glob_dir
+
+_glob_dir_found_pat:
+        ; (sp) = pattern
+
+        ; Open the directory currently in _pathname and iterate over all the
+        ; files in it. For those that match the pattern, this function is called
+        ; recursively, with the file's name appended to _pathname.
+
+        ld e, (ix + _pathname)
+        ld d, (ix + _pathname+1)
+        syscall opendir_
+        jr nc, _
+    pop de
+    ; Return like normal from the function (with nothing added to the pathv
+    ; list) if the error is "non-fatal"
+    ljp _glob_error
+_:
+
+_glob_dir_readdir:
+        syscall readdir_ ; Preserves hl
+        ; TODO Reset and check errno since there is no distinction in the return
+        ; value between an error and no more entries
+        jr c, _glob_dir_closedir
+        ; (hl) = DIR structure
+        ; (de) = dirent structure
+        ; (sp) = pattern
+
+        ex (sp), hl
+        push hl
+            ex de, hl
+            ; dirent_name = 2
+            inc hl \ inc hl
+
+            ; (sp) = DIR, pattern
+            ; (de) = pattern
+            ; (hl) = dirent name
+
+            bit BIT_GLOB_NOESCAPE, (ix + _flags)
+            jr nz, _
+            ld bc, FNM_PATHNAME | FNM_SINGLE | FNM_PERIOD
+            jr ++_
+_:
+            ld bc, FNM_PATHNAME | FNM_SINGLE | FNM_PERIOD | FNM_NOESCAPE
+_:
+            push de
+            push hl
+                lcall fnmatch
+            pop hl ; dirent name
+            pop de ; Pattern
+            jr c, _glob_dir_nomatch
+
+            ; Append the name in the dirent to _pathname and recurse
+            push de
+                ; Names in dirent structs are null-terminated, so we don't need
+                ; to use strnlen()
+                lcall strlen
+                ex de, hl
+                lcall _glob_append_pathname
+            pop hl ; Pattern
+            push de ; Save the location (from _glob_append_pathname)
+                ; Scan to the end of this segment of the pattern
+                ; TODO Get this above and store it? Calculating it every time is
+                ; a bit inefficient but it may be awkward to store it (and its
+                ; just a scan of a few characters)
+                ld a, '/'
+                lcall strchr
+                jr nc, _
+                ; If no more '/'s, just add the name to pathv
+                lcall _glob_append_pathv
+                jr ++_
+_:
+                lcall _glob_dir
+_:
+            pop hl
+            ; Terminate _pathname where it was before
+            ld (hl), 0
+
+_glob_dir_nomatch:
+        pop hl
+        ex (sp), hl
+        ; (sp) = pattern
+        ; (hl) = DIR
+
+        jr _glob_dir_readdir
+
+_glob_dir_closedir:
+    pop de ; Pattern
+    syscall closedir_
+    ret
+; }}}
+
+;; Handles errors based on errfunc and the flags.
+; Return:
+;   Only returns if execution should continue after the error.
+;
+_glob_error: ; {{{
+    ld l, (ix + _errfunc)
+    ld h, (ix + _errfunc+1)
+    ld a, h
+    or l
+    jr z, _glob_error_flag
+
+    ; Call the error callback using the C calling convention: parameters passed
+    ; on the stack in reverse order
+    ;   int errfunc(const char *epath, int eerrno);
+    push ix ; Don't assume the function preserves anything
+        lld bc, (errno)
+        push bc
+        push de
+        lld de, _glob_error_ret
+        push de
+        jp (hl)
+_glob_error_ret:
+    pop ix
+    ; Look at flag if returned non-0
+    ld a, h
+    or l
+    ret z
+
+_glob_error_flag:
+    bit BIT_GLOB_ERR, (ix + _flags)
+    ret z
+    ld a, GLOB_ABORTED
+    scf
+    ljp _glob_exit
+; }}}
+
+;; Appends a path segment to the pathname stored in the beginning data
+;; structure (at _pathname).
+; If the name to append is empty (""), the current pathname will be apppended
+; with a '/'. This is to make patterns with useless slashes return results with
+; those slashes mirrored (and thats just how the logic inside happens to work).
+;
+; Parameters:
+;   (ix) - Assorted data (as throughout the glob() functions)
+;   (de) - Segment to append.
+;   bc - Length of segment
+; Return:
+;   (de) - Start of the segment inside the _pathname string, including a
+;   beginning '/'. This is stored so that the pathname can be restored to its
+;   previous state by writing a null to this location.
+;
+_glob_append_pathname: ; {{{
+    ; Find sizes of the current and new segments and expand the buffer if
+    ; necessary. Lengths are all single-byte since PATH_MAX = 256 (which
+    ; includes the null-terminator). _pathname_cap just counts the length, not
+    ; the null terminator
+    ; Segment must be at most NAME_MAX bytes
+    ld hl, -(NAME_MAX+1)
+    add hl, bc
+    jr nc, _
+    ld hl, ENAMETOOLONG
+    lld (errno), hl
+    lcall _glob_error
+_:
+
+    ld l, (ix + _pathname)
+    ld h, (ix + _pathname+1)
+    push bc
+        lcall strlen
+        ld c, a
+    pop bc
+
+    ; See if the total size overflows the byte
+    add a, c
+    inc a ; Also need a '/'
+    ; TODO Should this use _glob_error with ENAMETOOLONG instead?
+    ljp c, _glob_nospace
+
+    cp (ix + _pathname_cap)
+    jr c, _glob_ap_concat
+    jr z, _glob_ap_concat
+
+_glob_ap_grow_buf:
+    push bc
+        ld (ix + _pathname_cap), a
+
+        ; TODO Should this be grown exponentially? Since at most NAME_MAX bytes
+        ; are added each time and paths are generally not very deep, I think
+        ; this is okay and saves some space
+        ld b, 0
+        ld c, a
+        inc bc ; Allocate null byte
+
+        ld l, (ix + _pathname)
+        ld h, (ix + _pathname+1)
+        push de
+            syscall realloc_
+        pop de
+        ljp c, _glob_nospace
+        ld (ix + _pathname), l
+        ld (ix + _pathname+1), h
+    pop bc
+
+    ; Skip over getting the pathname
+    jr _
+
+_glob_ap_concat:
+    ld l, (ix + _pathname)
+    ld h, (ix + _pathname+1)
+_:
+
+    ; Append '/' (goto end of string first)
+    push bc
+    push de
+        xor a
+        cp (hl)
+        ; Have to handle the first one a bit different since we don't add a
+        ; leading '/'
+        jr z, _glob_ap_first
+        lcall strchr
+
+        ex de, hl
+        ld (hl), '/'
+        inc hl
+        ld (hl), 0 ; In case the length is 0 (stpncpy() will not add a null)
+    pop de
+    pop bc
+    ex de, hl
+
+    ; (de) = after end of the current path (and new '/')
+    ; (hl) = new segment
+    push de
+        lcall stpncpy
+        inc de
+        xor a
+        ld (de), a
+    pop de
+    dec de ; Move to the '/'
+    ret
+
+_glob_ap_first:
+    pop de
+    pop bc
+    ex de, hl
+
+    push de
+        lcall stpncpy
+        inc de
+        xor a
+        ld (de), a
+    pop de
+    ret
+; }}}
+
+;; Appends the current pathname (in _pathname) to the glob structure.
+; Parameters:
+;   (ix) - Assorted data (as throughout the glob() functions)
+;
+_glob_append_pathv: ; {{{
+    ; TODO Add '/' for directories if GLOB_MARK is set
+
+    ; TODO Store the sum pathc + offs
+    ld l, (ix + _pglob)
+    ld h, (ix + _pglob+1)
+    ; gl_pathc = 0
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    bit BIT_GLOB_DOOFFS, (ix + _flags)
+    jr z, _
+    inc hl
+    ; gl_offs = 4
+    inc hl \ inc hl
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    add hl, de
+    jr ++_
+_:
+    ex de, hl
+_:
+    inc hl ; Also need a null pointer at the end
+    add hl, hl ; 2 byte per element
+
+    ld c, (ix + _pathv_cap)
+    ld b, (ix + _pathv_cap+1)
+    ; or a ; Impossible for the size above to overflow, so carry is reset
+    sbc hl, bc
+    ; capacity has to be > current size (if equal, appending would overflow)
+    jr c, _glob_apv_append
+
+    ; Grow buffer exponentially by a factor of 2
+    ; TODO Exclude the offs size in the exponential growth? Change growth
+    ; factor? Grow linearly?
+
+    ; The size shouldn't overflow since there is not enough memory available to
+    ; store that many pointers
+    ; Really, it is unrealistic for this size to be larger than 1-byte anyway,
+    ; but it is technically possible, so error out if the size overflows
+    add hl, bc ; hl = pathc + offs
+    push hl ; Save the current size for _glob_apv_append
+        add hl, hl
+        ljp c, _glob_nospace
+        ld b, h \ ld c, l
+
+        ld (ix + _pathv_cap), c
+        ld (ix + _pathv_cap+1), b
+
+        ld l, (ix + _pglob)
+        ld h, (ix + _pglob+1)
+        ; gl_pathv = 2
+        inc hl \ inc hl
+        ld e, (hl)
+        inc hl
+        ld d, (hl)
+
+        ex de, hl
+        push de
+            syscall realloc_
+            ljp c, _glob_nospace
+        pop de
+        ex de, hl
+
+        ; Load from the back (MSB)
+        ld (hl), d
+        dec hl
+        ld (hl), e
+    pop hl
+
+    jr _ ; Skip over the add hl, bc since it was done above
+
+_glob_apv_append:
+    ; hl = pathc + offs - pathv_cap
+    ; bc = pathv_cap
+    ; (all adjusted fofr the element size)
+    add hl, bc
+_:
+    dec hl \ dec hl ; Don't count the null
+    ld b, h \ ld c, l
+    ; bc = offset into pathv
+
+    ld l, (ix + _pglob)
+    ld h, (ix + _pglob+1)
+
+    ; Increment pathc
+    ; gl_pathc = 0
+    inc (hl)
+    jr nz, _
+    inc hl
+    inc (hl)
+    jr ++_
+_:
+    ; gl_pathv = 2
+    inc hl
+_:
+    inc hl
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+
+    add hl, bc
+    ex de, hl
+
+    ld l, (ix + _pathname)
+    ld h, (ix + _pathname+1)
+    push de
+        lcall strdup
+        ljp c, _glob_nospace ; Doesn't care about the stack
+    pop de
+    ex de, hl
+    ; (hl) = pathv element
+    ; (de) = pathname dup'ed to the heap
+
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    inc hl
+    ; Write trailing null
+    xor a
+    ld (hl), a
+    inc hl
+    ld (hl), a
+
+    ret
+; }}}
+
+#undefine _pglob
+#undefine _errfunc
+#undefine _flags
+#undefine _pathname
+#undefine _pathname_cap
+#undefine _pathv_cap
+#undefine _statbuf
+
+; }}}
+
+#endif
+

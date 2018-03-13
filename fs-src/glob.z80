@@ -1,0 +1,129 @@
+;
+; glob.z80
+;
+; Test utiliity for glob()
+;
+
+.nolist
+#include "tix.inc"
+#include "unistd.inc"
+.list
+
+.org $0000
+.db "TIXE"
+.dw $400
+.dw $100
+.dw text
+.dw text_end - text
+.dw data
+.dw data_end - data
+
+text:
+tixe_sec_start("text")
+
+    ; int main(int argc, char *argv[]);
+    pop de
+    pop bc
+    pop hl
+    push hl
+    push bc
+    push de
+
+    ld a, c
+    cp 2
+    jr nz, done
+    ld a, b
+    or a
+    jr nz, done
+
+    inc hl \ inc hl
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+
+    ; di \ halt
+
+    ld bc, 0
+    ld ix, 0
+    lld iy, glob_buf
+    lcall glob
+    jr nc, matched
+    cp GLOB_NOMATCH
+    jr z, nomatch
+    cp GLOB_ABORTED
+    jr z, aborted
+    jr done
+
+matched:
+    lld iy, glob_buf
+    ld l, (iy + gl_pathv)
+    ld h, (iy + gl_pathv+1)
+
+print_loop:
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    inc hl
+
+    ld a, d
+    or e
+    jr z, done
+    push hl
+        ex de, hl
+        lcall strlen
+        push hl \ pop iy
+        ld a, STDOUT_FILENO
+        syscall write_
+
+        lld iy, nl_char
+        ld bc, 1
+        ld a, STDOUT_FILENO
+        syscall write_
+    pop hl
+    jr print_loop
+
+done:
+    ld hl, 0
+    ret
+
+aborted:
+    lld iy, aborted_str
+    ld bc, aborted_str_len
+    ld a, STDERR_FILENO
+    syscall write_
+    ld hl, -1
+    ret
+
+nomatch:
+    lld iy, nomatch_str
+    ld bc, nomatch_str_len
+    ld a, STDERR_FILENO
+    syscall write_
+    ld hl, -1
+    ret
+
+#include "fs-src/utils.z80"
+#include "fs-src/pattern.z80"
+
+tixe_sec_end()
+text_end:
+
+data:
+tixe_sec_start("data")
+
+glob_buf:
+    .fill sizeof_glob
+
+nl_char:
+    .db '\n'
+
+aborted_str:
+    .db "aborted\n",0
+aborted_str_len .equ $ - aborted_str
+
+nomatch_str:
+    .db "no match\n",0
+nomatch_str_len .equ $ - nomatch_str
+
+tixe_sec_end()
+data_end:
