@@ -43,62 +43,71 @@ argv .equ 4
     ld l, (ix + argv)
     ld h, (ix + argv+1)
     inc hl \ inc hl
-rm_files:
+cp_files:
     ; (de) = current name
     ld e, (hl)
     inc hl
     ld d, (hl)
     inc hl
 
-    ; (bc) = new name
     push bc
-        ld c, (hl)
+        push hl
+
+            ld hl, O_RDONLY
+            syscall open_
+            jr c, read_error
+
+        pop hl
+        ; Get destination file name
+        ld e, (hl)
         inc hl
-        ld b, (hl)
+        ld d, (hl)
         inc hl
         push hl
-            ld h, b \ ld l, c
-            syscall rename_
-            jr nc, _
-            lld iy, error_str
-            ld bc, error_str_len
-            ld a, STDERR_FILENO
-            syscall write_
 
-        pop iy \ push iy
-            ; Get the old name again to print it out
-            ld l, (iy - 4)
-            ld h, (iy - 3)
-            lcall strlen
-            push hl \ pop iy
-            ld a, STDERR_FILENO
-            syscall write_
+            push af
+                ld hl, O_WRONLY | O_CREAT | O_TRUNC
+                ; TODO Create a way to get the mode of the source file
+                ld bc, S_IFREG | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH
+                syscall open_
+            pop de ; d = read fd
+            jr c, write_error
+            ld e, a
 
-            lld iy, to_str
-            ld bc, to_str_len
-            ld a, STDERR_FILENO
-            syscall write_
+copy_loop:
+            lld iy, buf
+            ld bc, BUF_SIZE
+            ld a, d
+            push de
+                syscall read_
+            pop de
+            ld a, b
+            or c
+            jr z, copy_done
 
-        pop iy \ push iy
-            ; Get the new name again to print it out
-            ld l, (iy - 2)
-            ld h, (iy - 1)
-            lcall strlen
-            push hl \ pop iy
-            ld a, STDERR_FILENO
-            syscall write_
+            lld iy, buf
+            ld a, e
+            push de
+                syscall write_
+            pop de
+            jr copy_loop
+copy_done:
 
-            lld iy, err_end_str
-            ld bc, err_end_str_len
-            syscall write_
-_:
+            ld a, e
+            push de
+                syscall close_
+            pop de
+write_error:
+            ld a, d
+            syscall close_
+read_error:
         pop hl
     pop bc
 
     dec bc
     ld a, b
     or c
-    jr nz, rm_files
+    jr nz, cp_files
 
 done:
     ld hl, 0
@@ -108,8 +117,6 @@ fail:
     ld hl, -1
     syscall exit_
 
-#include "fs-src/string.z80"
-
 tixe_sec_end()
 text_end:
 
@@ -117,16 +124,13 @@ data:
 tixe_sec_start("data")
 
 error_str:
-    .db "Could not rename '"
+    .db "cannot copy file\n"
 error_str_len .equ $ - error_str
 
-to_str:
-    .db "' to '"
-to_str_len .equ $ - to_str
-
-err_end_str:
-    .db "'\n"
-err_end_str_len .equ $ - err_end_str
+; Buffer for copying files
+BUF_SIZE .equ 128
+buf:
+    .fill BUF_SIZE
 
 tixe_sec_end()
 data_end:

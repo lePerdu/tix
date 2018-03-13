@@ -270,7 +270,7 @@ child_fork:
     inc hl
     ld a, (hl)
     ld ixh, a
-    inc hl
+    dec hl
     syscall execv_
 
     ld hl, 1
