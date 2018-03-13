@@ -290,6 +290,50 @@ _respthd_fail:
 ; }}}
 
 
+;; Gets file status information
+; Parameters:
+;   (de) - Path of the file.
+;   (hl) - Buffer of type stat to store the data.
+; Return:
+;   c flag - Reset if the file was found, set if not.
+; Preserves:
+;   ix
+;
+stat: ; {{{
+    push hl
+        call resolve_path
+    pop de
+    ret c
+
+    jp fs_stat
+; }}}
+
+
+;; Gets file status information from a file descriptor.
+; Parameters:
+;   a - File descriptor pointing to the file.
+;   (hl) - Buffer of type stat to store the data.
+; Return:
+;   c flag - Reset if the file was found, set if not.
+; Preserves:
+;   ix
+;
+fstat: ; {{{
+    ex de, hl
+    call fildes_deref_full ; Preserves de
+    ret c
+    ; (hl) = file description
+
+    ; filtab_ent_inode = 0
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+
+    jp fs_stat
+; }}}
+
+
 ;; Changes the working directory of the current process.
 ; Parameters:
 ;   (de) - Path to new working directory.

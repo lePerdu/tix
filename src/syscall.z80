@@ -45,6 +45,9 @@ syscall_table:
     .db $00 \ .dw dup2
     .db $00 \ .dw fcntl
 
+    .db $00 \ .dw stat
+    .db $00 \ .dw fstat
+
     .db $00 \ .dw opendir
     .db $00 \ .dw closedir
     .db $00 \ .dw readdir

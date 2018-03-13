@@ -998,6 +998,113 @@ _:
 ; }}}
 
 
+;; Gets file status information.
+; Parameters:
+;   hl - Inode of the file.
+;   (de) - Buffer of type stat to store the information.
+; Return:
+;   c flag - Reset if the file data could be read, set if the inode is invalid.
+;
+fs_stat: ; {{{
+    or a
+    ld a, i
+    in a, (PORT_MEM_BANK_A)
+    push af
+        di
+
+        push de
+        push hl
+            call fs_search_inode_
+        pop bc ; Inode
+        pop de
+        jr nc, _
+        ex de, hl
+    pop af
+    out (PORT_MEM_BANK_A), a
+    scf
+    ret po
+    ei
+    ret
+_:
+        ; a = page of file
+        ; (de) = file inode data
+        ; (hl) = stat buffer
+        ; bc = inode number
+        out (PORT_MEM_BANK_A), a
+
+        xor a
+        ; dev
+        ld (hl), a
+        inc hl
+        ld (hl), a
+        inc hl
+        ; inode
+        ld (hl), c
+        inc hl
+        ld (hl), b
+        inc hl
+
+        ; Get the file type for later
+        inc de
+        ld a, (de)
+        dec de
+
+        ; Inode data
+        ex de, hl
+        ld bc, sizeof_inode
+        ldir
+        ; (hl) = start of file data
+        ; (de) = rdev in the stat structure
+        ; bc = 0
+
+        ; rdev (only if a character or block special file)
+        and S_IFMT >> 8
+        cp S_IFCHR >> 8
+        jr z, _
+        cp S_IFBLK >> 8
+        jr nz, ++_
+_:
+        ; Device is immediately after the inode
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+        dec hl ; Put it back for consistency accross branches
+_: ; If bc was not set to the device, it is 0 from ldir
+        ex de, hl
+        ld (hl), c
+        inc hl
+        ld (hl), b
+        inc hl
+
+        ; blksize (1)
+        ld (hl), 1
+        inc hl
+        ld (hl), 0
+        inc hl
+
+        ; blocks (file size + sizeof_inode)
+        ; (de) = start of file data
+        ld bc, inode_size - sizeof_inode
+        ex de, hl
+        add hl, bc
+        ld c, (hl)
+        inc hl
+        ld b, (hl)
+        ld hl, sizeof_inode
+        add hl, bc
+        ex de, hl
+
+        ld (hl), e
+        inc hl
+        ld (hl), d
+    pop af
+    out (PORT_MEM_BANK_A), a
+    ret po
+    ei
+    ret
+; }}}
+
+
 ;; Adjusts the log tail so that data of a specified size can be written, garbage
 ;; collecting if necessary.
 ; The size must not excede a single page ($4000 = 16 KiB).
