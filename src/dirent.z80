@@ -72,6 +72,8 @@ _:
 ;; Closes a directory stream.
 ; Parameters
 ;   (hl) - Directory stream.
+; Preserves:
+;   ix
 ;
 closedir: ; {{{
     ; Just free it
@@ -131,6 +133,8 @@ _:
     ld (hl), c
     ; Move back to the start
     dec hl \ dec hl
+    ; Carry reset from or (hl) (way) above
+    or a
     ret
 ; }}}
 

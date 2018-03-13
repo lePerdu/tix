@@ -242,14 +242,15 @@ flash_copy:
             ld d, a
         exx
 _fcpy_check:
+        ; (~dest & src) must be 0
         ld a, (de)
         cpl
 
         ex af, af'
         exx
-        ld a, d
+        ld a, e
         out (PORT_MEM_BANK_A), a
-        ld a, e ; Prepare for switching back
+        ld a, d ; Prepare for switching back
         exx
         ex af, af'
 

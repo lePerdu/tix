@@ -713,16 +713,17 @@ fs_next_direntry: ; {{{
                 push hl \ pop iy ; Index registers are nice for structures
 
                 ; Check if a directory (type is in MSB)
-                ; This is only called from readdir(), but the check is still made in
-                ; case the inode was reused.
+                ; This is only called from readdir(), but the check is still
+                ; made in case the inode was reused.
                 ld b, (iy + inode_mode+1) ; Needed below
                 ld a, b
                 and S_IFMT >> 8
                 cp S_IFDIR >> 8
-                jr c, _fsnde_fail_2p
+                jr nz, _fsnde_fail_2p
 
                 ; Need search and read permission
-                ; This does have to be checked every time because it could be changed.
+                ; This does have to be checked every time because it could be
+                ; changed.
                 ld a, O_SEARCH | O_RDONLY
                 ld c, (iy + inode_mode)
                 ;ld b, (iy + inode_mode+1)
@@ -764,6 +765,7 @@ fs_next_direntry: ; {{{
         ld (de), a
     pop af
     out (PORT_MEM_BANK_A), a
+    or a
     ret
 
 _fsnde_fail_2p:
@@ -971,7 +973,6 @@ fs_get_uid_gid: ; {{{
         push hl
             call fs_search_inode_
         pop de
-        ; Doing this 3 times is kind of odd but I think the most efficient
         jr nc, _
         ex de, hl
     pop af
@@ -1127,8 +1128,9 @@ _:
 ;   a - The page of the old file.
 ;   (de) - The end of the new file (page in bank A).
 ;   (fs_tail) - Stores the location of the start of the new file (i.e. has not
-;   yet been updated).
-;   (bc) - Inode entry location in the inode file.
+;       yet been updated).
+;   (bc) - Inode entry location in the inode file (if not updating the inode
+;       file location).
 ;
 fs_update_file_loc_: ; {{{
     push bc
@@ -1143,10 +1145,6 @@ fs_update_file_loc_: ; {{{
 
         ; Invalidate the old file (the | ~S_IFMT is to avoid overwriting other
         ; mode bits)
-        ; Some bug in SPASM makes it complain about the value being too large
-        ; (probably something to do with the compliment and it using regular int
-        ; types instead of 16-bit values when calculating expressions), so the
-        ; value is masked after being shifted
         ld a, (S_IDEL | ~S_IFMT) >> 8 & $FF
         ; inode_mode = 0
         inc hl ; Write to MSB
@@ -1156,10 +1154,16 @@ fs_update_file_loc_: ; {{{
     pop bc
 
     ; fs_tail has not been updated, so it points to the start of the new file.
-    ld de, (fs_tail+1)
-    ld (fs_tail+1), hl
+    ; Files cannot span pages, so the start and end of the file are both of the
+    ; page set to fs_tail above
+    ; TODO Update this when/if files can span pages
+    ld a, (fs_tail) ; New page
+    out (PORT_MEM_BANK_A), a
+    ld de, (fs_tail+1) ; Starting address
+    ld (fs_tail+1), hl ; Ending address
     ex de, hl
 
+    ; See if the file is the inode file
     inc hl
     ld a, (hl)
     dec hl
@@ -1283,7 +1287,6 @@ _fswfum_ua_next_page:
 
 _fswfum_ua_done:
     ; Clean up the stack.
-    ; hl is after the data to write = the original stack pointer
     pop hl
     inc sp
 
@@ -1322,10 +1325,10 @@ fs_read_file: ; {{{
         pop bc
         jr c, _fsrf_fail
 
+        out (PORT_MEM_BANK_A), a
         push hl
             ; inode_size = 2
-            inc hl
-            inc hl
+            inc hl \ inc hl
             ld a, (hl)
             inc hl
             ld h, (hl)
@@ -1334,18 +1337,17 @@ fs_read_file: ; {{{
             ; size - offset - len
             or a
             sbc hl, de
-            sbc hl, bc
-            ld a, h
             or a
+            sbc hl, bc
             jp p, _
             ; if < 0, len = size - offset
             add hl, bc
             ld b, h \ ld c, l
 _:
         pop hl
-        ; Nothing to write
         ld a, b
         or c
+        ; Nothing to read
         jr z, _
 
         add hl, de
@@ -1393,6 +1395,8 @@ _fsrf_fail:
 ; and the inode file being written multiple times, but if there is a way to
 ; change that, the speed would be about the same as it is now, as the main
 ; bottleneck is writing to flash.
+;
+; TODO Handle writing past the end of the file (?)
 ;
 ; Parameters:
 ;   hl - Inode number.
@@ -1472,7 +1476,7 @@ _:
                 ; de points to the end of the new file for the remainder of the
                 ; function to chain together calls to flash_write_buf (which
                 ; acts like ldir)
-                ld de, (fs_tail+1)
+                ex de, hl ; (de) = fs_tail offset from fs_find_space_
                 ld hl, kernel_tmp
                 ld bc, sizeof_inode
                 call flash_write_buf
@@ -1493,13 +1497,11 @@ _:
                 ld a, (ix + _rom_page)
                 call flash_copy
             pop hl
-            pop bc ; Popped off later
-
+            pop af ; Offset (temporarily, to rearrange the stack)
         pop bc ; Data length
 
         push bc
-            dec sp ; Move back over the data offset pushed from before
-            dec sp
+            push af ; Push back the data offset
                 push hl
                     ; Write the new data
 
@@ -1533,7 +1535,7 @@ _:
             ; Negate hl into bc
             ld a, h
             cpl
-            ld c, a
+            ld b, a
             ld a, l
             cpl
             ld c, a
@@ -1636,7 +1638,7 @@ fs_append_file: ; {{{
                 ; Write the new inode
                 ld a, (fs_tail)
                 out (PORT_MEM_BANK_A), a
-                ld de, (fs_tail+1)
+                ex de, hl ; (de) = fs_tail offset from fs_find_space_
                 ld hl, kernel_tmp
                 ld bc, sizeof_inode
                 call flash_write_buf
@@ -1650,11 +1652,24 @@ fs_append_file: ; {{{
 
                 ; The size has to be found againn, but this is ieasier
                 ; than trying to save it from before.
+
+                ; Have to switch to the old page temporarily to get the size
+                ; (the value in kernel_tmp has been overwritten by the new size)
+                in a, (PORT_MEM_BANK_A)
+                ld c, a
+                ld a, (ix + _rom_page)
+                out (PORT_MEM_BANK_A), a
+                ld a, c ; New page
+
                 ; inode_size = 2
                 inc hl \ inc hl
                 ld c, (hl)
                 inc hl
                 ld b, (hl)
+
+                ; Restore to the new page
+                out (PORT_MEM_BANK_A), a
+
                 ld a, sizeof_inode - inode_size - 1
                 add a, l
                 ld l, a
@@ -1785,7 +1800,7 @@ _fswi_copy:
     push de
         ld a, (fs_tail)
         out (PORT_MEM_BANK_A), a
-        ex de, hl ; (hl) = fs_tail offset from fs_find_space_
+        ex de, hl ; (de) = fs_tail offset from fs_find_space_
         push iy \ pop hl
         ld bc, sizeof_inode
         ; (hl) - New inode
@@ -1801,9 +1816,9 @@ _fswi_copy:
         ld a, sizeof_inode
         add a, l
         ld l, a
-        ld a, 0
-        adc a, h
-        ld h, a
+        jr nc, _
+        inc h
+_:
         ; (hl) - Old data
 
         ; Rtrieve the size again (easier/faster than saving it)
@@ -1833,7 +1848,7 @@ _fswi_extend:
     push de
         ld a, (fs_tail)
         out (PORT_MEM_BANK_A), a
-        ex de, hl ; (hl) = fs_tail offset from fs_find_space_
+        ex de, hl ; (de) = fs_tail offset from fs_find_space_
         push iy \ pop hl
         ld bc, sizeof_inode
         ; (hl) - New inode
